@@ -1,0 +1,37 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+*.spec
+
+# PyInstaller build artifacts
+*.spec
+build/
+dist/
+
+# Excel output files (may contain sensitive data)
+output_pcf.xlsx
+*_PCF.xlsx
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Archive / temporary
+archive/
