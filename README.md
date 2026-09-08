@@ -110,7 +110,6 @@ CarbonFootprint Submodel
 ### Voraussetzungen
 
 - Python 3.10 oder neuer
-- Zugang zum WAGO-Netzwerk (VPN oder intern) für die API
 
 ### 1. Repository klonen
 
