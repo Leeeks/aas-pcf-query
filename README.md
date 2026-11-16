@@ -1,4 +1,4 @@
-﻿# 🌱 WAGO AAS PCF Query Tool
+# 🌱 WAGO AAS PCF Query Tool
 
 > **Studentenprojekt** – *„AAS & Nachhaltigkeitsdaten als Service: Neue Geschäftsmodelle für WAGO"*  
 > Corporate Sustainability · WAGO Kontakttechnik GmbH & Co. KG
@@ -42,44 +42,43 @@ Mit der zunehmenden Regulierung im Bereich Nachhaltigkeitsberichterstattung (CSR
 ### Überblick
 
 ```
-Excel Input (.xlsx)
+Excel Input (.xlsx) - Struktur-agnostisch (beliebige Spaltennamen/-positionen, Kurz-/Langformat)
         |
         v
-[  aas_pcf_query.py  ]  <- Hauptskript
-[  ThreadPoolExecutor ]  <- 5 parallele Worker-Threads
+[  aas_pcf_query.py  ]  <- Hauptskript (Auto-Detection + Normalisierung + ThreadPoolExecutor)
         |
         v
     FAST PATH (1 Request, ~66 ms)
-    Artikelnummer -> deterministisch konstruierte Submodel-ID
-    GET /smartdata-aas-env/submodels/{base64(SubmodelID)}
+    Artikelnummer (normalisiert auf Kurzformat) -> CarbonFootprint-Submodel-ID
+    GET /smartservice-aas/submodels/{base64(SubmodelID)}
         |
         +-- HTTP 200 -> PCF-Wert extrahieren (fertig)
         |
-        +-- HTTP 404 -> FALLBACK (2-3 Requests, ~15 s)
+        +-- HTTP 404 -> FALLBACK (1-2 Requests, ~70 ms)
                 |
-                +-- GET /smartdata-aas-registry/shell-descriptors
+                +-- GET /smartservice-aas/shell-descriptors?assetIds={base64url(AssetIdObj)}
                         |
                         +-- Submodel-ID ermitteln -> PCF-Submodel fetchen
         |
         v
-    Excel Output (.xlsx) <- PCF-Wert + Status pro Artikel
+    Excel Output (.xlsx) <- Article Number (Short) + Article Number (Long) + PCF + PCF Status
 ```
 
-### Verwendete AAS-Endpoints
+### Verwendete AAS-Endpoints (SmartService AAS API v3.2)
 
 | # | Endpoint | Methode | Rolle |
 |---|----------|---------|-------|
-| 1 | `https://c1.api.wago.com/smartdata-aas-env/submodels/{base64(ID)}` | GET | Fast Path: direkter PCF-Submodel-Fetch |
-| 2 | `https://c1.api.wago.com/smartdata-aas-registry/shell-descriptors?assetIds={enc}` | GET | Fallback: Shell-Lookup über Asset-ID |
-| 3 | `https://c1.api.wago.com/smartdata-aas-env/submodels/{base64(SM-ID)}` | GET | Fallback: PCF-Submodel via gefundene ID |
+| 1 | `https://c1.api.wago.com/smartservice-aas/submodels/{base64(ID)}` | GET | Fast Path: direkter CarbonFootprint-Submodel-Fetch |
+| 2 | `https://c1.api.wago.com/smartservice-aas/shell-descriptors?assetIds={enc}` | GET | Fallback: Shell-Lookup über `globalAssetId` |
+| 3 | `https://c1.api.wago.com/smartservice-aas/submodels/{base64(SM-ID)}` | GET | Fallback: PCF-Submodel via gefundene ID |
 
 ### AAS-Submodel-URL-Konstruktion (Fast Path)
 
 ```python
-# Artikelnummer -> Submodel-URL (kein Registry-Lookup nötig)
-submodel_id = f"https://wago.com/ids/submodel/{article_number}/PCF"
+# Artikelnummer (normalisiert auf Kurzformat) -> Submodel-URL
+submodel_id = f"https://www.wago.com/submodel/{article_short}/CarbonFootprint"
 encoded     = base64.b64encode(submodel_id.encode()).decode()
-url         = f"https://c1.api.wago.com/smartdata-aas-env/submodels/{encoded}"
+url         = f"https://c1.api.wago.com/smartservice-aas/submodels/{encoded}"
 ```
 
 ### PCF-Submodel-Struktur (AAS v3)
@@ -172,11 +171,12 @@ summary = main("input.xlsx", "output_pcf.xlsx")
 
 ### 5. Ergebnis
 
-| Article Number | PCF | PCF Status |
-|----------------|-----|------------|
-| 280-101 | 0.0156 | PCF available |
-| 855-9910 | not available | AAS available - PCF not available |
-| 999-xyz | not available | Article not found |
+| Article Number | Article Number (Short) | Article Number (Long) | PCF | PCF Status |
+|----------------|------------------------|-----------------------|-----|------------|
+| 280-101 | 280-101 | 0280-0101 | 0.0411 | PCF available |
+| 0221-0412 | 221-412 | 0221-0412 | 0.0116 | PCF available |
+| 855-9910 | 855-9910 | 0855-9910 | Not yet available | Not yet available |
+| 999-999 | 999-999 | 0999-0999 | Not yet available | Not yet available |
 
 ---
 
@@ -184,7 +184,9 @@ summary = main("input.xlsx", "output_pcf.xlsx")
 
 ```
 aas-pcf-query/
-+-- aas_pcf_query.py             # Hauptskript: API-Client + GUI + Batch
++-- aas_pcf_query.py             # Hauptskript: API-Client + Normalisierung + Excel-Detection + GUI + Batch
++-- tests/
+|   +-- test_aas_pcf_query.py    # Automatisierte Pytest-Testsuite
 +-- requirements.txt             # Python-Abhängigkeiten
 +-- AAS_Performance_Analysis.md  # Performance-Analyse & Bottleneck-Report
 +-- input.xlsx                   # Beispiel-Eingabedatei (Artikelnummern)
@@ -198,8 +200,8 @@ aas-pcf-query/
 
 ```python
 # In aas_pcf_query.py:
-ARTICLE_COLUMN         = "Article Number"   # Spaltenname in der Excel-Datei
-AAS_ENV_BASE           = "https://c1.api.wago.com/smartdata-aas-env"
+AAS_BASE_URL           = "https://c1.api.wago.com/smartservice-aas"
+SUBMODEL_ID_TEMPLATE   = "https://www.wago.com/submodel/{article}/CarbonFootprint"
 CERT_VERIFY            = False              # TLS (Self-Signed Cert)
 REQUEST_TIMEOUT        = (5, 10)           # (connect, read) in Sekunden
 WORKERS                = 5                 # Parallele Worker-Threads
@@ -208,14 +210,13 @@ SLOW_REQUEST_THRESHOLD = 3.0               # Logging-Schwelle in Sekunden
 
 ---
 
-## Status-Codes
+## Status-Codes (Kunden-Export)
 
 | Status | Bedeutung |
 |--------|-----------|
 | `PCF available` | PCF-Wert erfolgreich abgerufen |
-| `AAS available - PCF not available` | Artikel im AAS, aber kein PCF-Submodel |
-| `Article not found` | Artikel nicht im AAS-Portal registriert |
-| `Query error` | Technischer Fehler (Timeout, Verbindungsfehler) |
+| `Not yet available` | Für dieses Produkt liegt aktuell noch kein PCF-Wert vor |
+| `Query error` | Technischer Abfragefehler (Timeout, Authentifizierungs- oder Verbindungsfehler) |
 
 ---
 
