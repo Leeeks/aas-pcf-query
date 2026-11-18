@@ -25,6 +25,15 @@ STATUS_NOT_YET_AVAILABLE      = "Not yet available"
 INTERNAL_STATUS_PCF_AVAILABLE = "PCF available"
 INTERNAL_STATUS_NOT_FOUND     = "Article not found"
 
+DEFAULT_OFFLINE_PCF_UNIT      = "kg CO2e"
+DEFAULT_OFFLINE_REF_UNIT      = "piece"
+DEFAULT_OFFLINE_REF_QUANTITY  = 1.0
+OFFLINE_DATA_SOURCE_LABEL     = "Embedded Snapshot (Q4 2026)"
+OFFLINE_EXCEL_HEADER_NOTE     = (
+    "The provided PCF values are based on a fixed data snapshot from Q4 2026 "
+    "and are not automatically updated. Current PCF values are available in the WAGO AAS Portal."
+)
+
 _article_parser_fn: Optional[Callable[[Any], Dict[str, Any]]] = None
 
 
@@ -6245,8 +6254,8 @@ EMBEDDED_PCF_DATA: Dict[str, float] = {
     '734-010/K100-881/000-001': 0.05656674761842988,
     '734-010/K100-881/000-004': 0.05656674761842943,
     '734-025/K050-1745/000-000': 0.1444694673519086,
-    '734-025/K050-1745/000-00200PW25-000': 0.04099499684059987,
-    '734-025/K050-1745/000-0100PW25-000': 0.06987960626582879,
+    '734-025/K050-1745/000-00200PW25-000': 0.040994997,
+    '734-025/K050-1745/000-0100PW25-000': 0.069879606,
     '734-099/000-001': 0.06716321391059678,
     '734-099/000-002': 0.09313820662059594,
     '734-099/000-003': 2.106461982982001,
@@ -9774,10 +9783,14 @@ def get_offline_pcf_result(
     if not parsed["original"]:
         return {
             "pcf": None,
+            "unit": "",
+            "reference_unit": "",
+            "reference_quantity": None,
             "status": STATUS_NOT_YET_AVAILABLE,
             "internal_status": INTERNAL_STATUS_NOT_FOUND,
             "article_short": "",
             "article_long": "",
+            "source": OFFLINE_DATA_SOURCE_LABEL,
         }
 
     canonical = parsed["canonical"]
@@ -9792,18 +9805,26 @@ def get_offline_pcf_result(
     if pcf_val is not None:
         return {
             "pcf": pcf_val,
+            "unit": DEFAULT_OFFLINE_PCF_UNIT,
+            "reference_unit": DEFAULT_OFFLINE_REF_UNIT,
+            "reference_quantity": DEFAULT_OFFLINE_REF_QUANTITY,
             "status": STATUS_PCF_AVAILABLE,
             "internal_status": INTERNAL_STATUS_PCF_AVAILABLE,
             "article_short": short_art,
             "article_long": long_art,
+            "source": OFFLINE_DATA_SOURCE_LABEL,
         }
 
     return {
         "pcf": None,
+        "unit": "",
+        "reference_unit": "",
+        "reference_quantity": None,
         "status": STATUS_NOT_YET_AVAILABLE,
         "internal_status": INTERNAL_STATUS_NOT_FOUND,
         "article_short": short_art,
         "article_long": long_art,
+        "source": OFFLINE_DATA_SOURCE_LABEL,
     }
 
 

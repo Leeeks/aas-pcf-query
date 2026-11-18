@@ -1,31 +1,37 @@
 """
 aas_pcf_query.py
 ================
-Liest WAGO-Artikelnummern aus einer Excel-Datei, fragt fuer jede Nummer den
-PCF-Wert (Product Carbon Footprint, kg CO2e) ueber die WAGO AAS API ab
-und schreibt die Ergebnisse kundenfreundlich in eine neue Excel-Datei.
+WAGO Product Carbon Footprint (PCF) Query & Portfolio Analysis Tool.
+
+Unterstuetzt drei zentrale Workflows:
+1. Single Query          : Direkte Abfrage einzelner WAGO-Artikelnummern (Kurz- oder Langformat).
+2. Batch Query           : Struktur-agnostischer Excel-Import (.xlsx & .xls) inkl. Drag-and-Drop
+                           und standardisiertem Export in das Worksheet 'PCF Results' bei
+                           vollstaendigem Erhalt aller Original-Worksheets.
+3. PCF Portfolio Coverage: Interne Portfolio-Analyse ueber alle erreichbaren AAS-Shells
+                           inkl. Abgleich mit dem eingebetteten Q4-2026-Referenzdatenbestand.
 
 Ausfuehren:
     python aas_pcf_query.py
-
-Technische Grundlage (WAGO SmartService AAS API v3.2):
-    Basis-URL       : https://c1.api.wago.com/smartservice-aas
-    Submodel-ID     : https://www.wago.com/submodel/{article_short}/CarbonFootprint
-    Shell-ID        : https://wago.com/ids/aas/{article_short}
-    GlobalAsset-ID  : https://wago.com/ids/asset/{article_short}
-    Fast-Path-URL   : {AAS_BASE_URL}/submodels/{base64(Submodel-ID)}
-    Fallback-URL    : {AAS_REGISTRY_BASE}/shell-descriptors?assetIds={base64url(AssetIdObj)}
-
-    Der PCF-Wert befindet sich im Feld PcfCO2eq innerhalb der
-    SubmodelElementList ProductCarbonFootprints.
 """
 
 from __future__ import annotations
 
 import base64
+import ctypes
+from ctypes import wintypes
+import datetime
+import email
+from email import policy as email_policy
+import html
+from html.parser import HTMLParser
+import io
 import json
 import os
+import queue
+import quopri
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -33,24 +39,39 @@ import time
 import tkinter as tk
 import urllib.parse
 import webbrowser
+import xml.etree.ElementTree as ET
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 import pandas as pd
 import requests
 import urllib3
+
+try:
+    import xlrd
+except ImportError:
+    xlrd = None  # type: ignore
 
 # ── Konfiguration (Zentralisiert) ────────────────────────────────────────────
 
 ARTICLE_COLUMN = "Article Number"   # Standard-Spaltenname (Fallback/Default)
 
+PCF_RESULTS_SHEET_NAME = "PCF Results"
+
 COL_ARTICLE_SHORT = "Article Number (Short)"
 COL_ARTICLE_LONG  = "Article Number (Long)"
 COL_PCF           = "PCF"
-COL_PCF_STATUS    = "PCF Status"
+COL_PCF_UNIT      = "PCF Unit"
+COL_PCF_STATUS    = "PCF Status"    # Nur noch fuer interne/Legacy-Kompatibilitaet
+
+DEFAULT_PCF_UNIT  = "kg CO2e"
+PORTAL_URL        = "https://aas.wago.com/"
 
 # WAGO SmartService AAS API Basis-URL (AAS Part 2 v3.2)
 AAS_BASE_URL      = os.environ.get("WAGO_AAS_BASE_URL", "https://c1.api.wago.com/smartservice-aas").rstrip("/")
@@ -79,18 +100,31 @@ WORKERS = 5
 # Schwellwert fuer Slow-Query-Logging (Sekunden)
 SLOW_REQUEST_THRESHOLD = 3.0
 
+# ── WAGO Corporate Design Farben (Section 8.2) ───────────────────────────────
+
+WAGO_GREEN         = "#6EC800"
+WAGO_GREEN_HOVER   = "#5EB000"
+WAGO_WHITE         = "#FFFFFF"
+WAGO_LIGHT_GREY    = "#EFF0F1"
+WAGO_ANTHRACITE_15 = "#DEDFE1"
+WAGO_ANTHRACITE_40 = "#A5A8AF"
+WAGO_ANTHRACITE_70 = "#616A73"
+WAGO_ANTHRACITE    = "#1F2837"
+WAGO_BLACK         = "#000000"
+
 # ── Status-Konstanten ────────────────────────────────────────────────────────
 
-# Kundenfreundliche Statuswerte (fuer Excel-Export und UI)
+# Kundenfreundliche Statuswerte
 STATUS_PCF_AVAILABLE     = "PCF available"
 STATUS_NOT_YET_AVAILABLE = "Not yet available"
 STATUS_NOT_AVAILABLE     = STATUS_NOT_YET_AVAILABLE  # Alias
 STATUS_QUERY_ERROR       = "Query error"
 
-# Interne Diagnose-Statuswerte (fuer Logging, Troubleshooting & interne Auswertung)
+# Interne Diagnose-Statuswerte (fuer Logging, Troubleshooting & Portfolio Coverage)
 INTERNAL_STATUS_PCF_AVAILABLE = "PCF available"
 INTERNAL_STATUS_AAS_NO_PCF    = "AAS available - PCF not available"
 INTERNAL_STATUS_NOT_FOUND     = "Article not found"
+INTERNAL_STATUS_INVALID_ART   = "Invalid article number"
 INTERNAL_STATUS_AUTH_ERROR    = "Authentication error"
 INTERNAL_STATUS_TIMEOUT       = "Request timeout"
 INTERNAL_STATUS_SERVER_ERROR  = "Server error"
@@ -113,13 +147,20 @@ MODE_LABELS  = {
     MODE_OFFLINE: "Offline (Q4 2026 Snapshot)",
 }
 
+# Workflow-Tab-Kennungen
+WORKFLOW_SINGLE    = "single"
+WORKFLOW_BATCH     = "batch"
+WORKFLOW_PORTFOLIO = "portfolio"
+
+SUPPORTED_EXCEL_EXTENSIONS = (".xlsx", ".xls")
+
 # ── WAGO Artikelnummern-Normalisierung & Konvertierung ───────────────────────
 
-# Primärer Block: <Serie>-<Artikel>[Suffix], z. B. 221-412, 0221-0412, 2000-115, 770-103-JPE
+# Primaerer Block: <Serie>-<Artikel>[Suffix], z. B. 221-412, 0221-0412, 2000-115, 770-103-JPE
 _RE_PRIMARY_NUMERIC = re.compile(
     r"^(\d{2,4})-(\d{3,4})((?:_[A-Za-z0-9]+|-[A-Za-z][A-Za-z0-9]*))?$"
 )
-# Primärer Block mit alphanumerischer Artikelkennung, z. B. 835-0FAR, 0835-0RSC
+# Primaerer Block mit alphanumerischer Artikelkennung, z. B. 835-0FAR, 0835-0RSC
 _RE_PRIMARY_ALPHANUM = re.compile(
     r"^(\d{3,4})-([0-9][A-Za-z0-9]{3})$"
 )
@@ -131,9 +172,9 @@ _RE_VARIANT_NUMERIC = re.compile(
 _RE_VARIANT_KZ = re.compile(
     r"^[A-Za-z]\d{3}-\d{3,4}(?:_[A-Za-z0-9]+)?$"
 )
-# Komplexer alphanumerischer Varianten-Block nach '/': z. B. 000-00200PW25-000
+# Komplexer alphanumerischer Varianten-Block nach '/': z. B. 000-00200PW25-000 oder 0000-00200PW25-0000
 _RE_VARIANT_COMPLEX = re.compile(
-    r"^(\d{3,4})-(\d{3,5}[A-Za-z0-9]+-\d{3,4})$"
+    r"^(\d{3,4})-(\d*[A-Za-z][A-Za-z0-9]*)-(\d{3,4})$"
 )
 # Kurzer alphabetischer Varianten-Suffix nach '/': z. B. KN
 _RE_VARIANT_ALPHA = re.compile(
@@ -185,11 +226,9 @@ def _is_plausible_unhyphenated_wago_8digit(d8: str, was_7digit: bool = False) ->
     if item == 0 and series < 100:
         return False
     if was_7digit:
-        # 7-stellige Zahl entstand durch Wegfall der fuehrenden '0' in Excel (0100..0999)
         return 100 <= series <= 999
     if d8.startswith("0"):
         return 100 <= series <= 999
-    # 4-stellige WAGO-Serien ohne fuehrende Null (z. B. 2000..2999, 7000..8999, 1000..1999)
     return (1000 <= series <= 2999) or (7000 <= series <= 8999)
 
 
@@ -240,7 +279,6 @@ def parse_article_number(value: Any, number_format: Optional[str] = None) -> Dic
             "format": "empty",
         }
 
-    # Excel-Textpraefix (fuehrendes Apostroph) und Float-Suffix (.0) bereinigen
     clean = raw_str[1:].strip() if raw_str.startswith("'") else raw_str
     if re.fullmatch(r"\d+\.0+", clean):
         clean = clean.split(".")[0]
@@ -307,7 +345,6 @@ def parse_article_number(value: Any, number_format: Optional[str] = None) -> Dic
     long_segments: List[str]  = []
     seg_formats: List[str]    = []
 
-    # 2a. Erster Block (Hauptartikelnummer)
     seg0 = segments[0]
     m_num = _RE_PRIMARY_NUMERIC.match(seg0)
     m_alp = _RE_PRIMARY_ALPHANUM.match(seg0) if not m_num else None
@@ -315,7 +352,6 @@ def parse_article_number(value: Any, number_format: Optional[str] = None) -> Dic
     if m_num:
         p0, p1, suffix = m_num.group(1), m_num.group(2), m_num.group(3) or ""
         series_val = int(p0)
-        # WAGO-Seriennummern liegen im Bereich >= 85 (verhindert Datums-/Bereichsangaben wie 12-345)
         if series_val < 85:
             return {
                 "original": raw_str,
@@ -325,7 +361,6 @@ def parse_article_number(value: Any, number_format: Optional[str] = None) -> Dic
                 "is_valid": False,
                 "format": "invalid",
             }
-        # 4-stellige Teilnummern, die bereits >= 1000 sind, duerfen nicht als 5-stellig interpretiert werden
         s_blk, l_blk, b_fmt = _format_part_pair(p0, p1, suffix)
         short_segments.append(s_blk)
         long_segments.append(l_blk)
@@ -359,7 +394,6 @@ def parse_article_number(value: Any, number_format: Optional[str] = None) -> Dic
             "format": "invalid",
         }
 
-    # 2b. Optionale Varianten-Segmente nach '/'
     for seg in segments[1:]:
         if _RE_VARIANT_KZ.match(seg) or _RE_VARIANT_ALPHA.match(seg):
             short_segments.append(seg)
@@ -369,18 +403,29 @@ def parse_article_number(value: Any, number_format: Optional[str] = None) -> Dic
 
         m_cplx = _RE_VARIANT_COMPLEX.match(seg)
         if m_cplx:
-            cp0, crest = m_cplx.group(1), m_cplx.group(2)
+            cp0, cmid, cp2 = m_cplx.group(1), m_cplx.group(2), m_cplx.group(3)
             cp0_long  = cp0.zfill(4)
             cp0_short = cp0_long[1:] if cp0_long.startswith("0") else cp0_long
-            short_segments.append(f"{cp0_short}-{crest}")
-            long_segments.append(f"{cp0_long}-{crest}")
-            seg_formats.append("short" if cp0 == cp0_short else "long")
+            cp2_long  = cp2.zfill(4)
+            cp2_short = cp2_long[1:] if cp2_long.startswith("0") else cp2_long
+            s_cplx = f"{cp0_short}-{cmid}-{cp2_short}"
+            l_cplx = f"{cp0_long}-{cmid}-{cp2_long}"
+            if seg == s_cplx and seg == l_cplx:
+                c_fmt = "both"
+            elif seg == s_cplx:
+                c_fmt = "short"
+            elif seg == l_cplx:
+                c_fmt = "long"
+            else:
+                c_fmt = "mixed"
+            short_segments.append(s_cplx)
+            long_segments.append(l_cplx)
+            seg_formats.append(c_fmt)
             continue
 
         m_var = _RE_VARIANT_NUMERIC.match(seg)
         if m_var:
             vp0, vp1, vsuffix = m_var.group(1), m_var.group(2), m_var.group(3) or ""
-            # Mindestens ein Teil sollte >= 3 Stellen haben oder eine Null-Variante sein
             if len(vp0) < 3 and len(vp1) < 3:
                 return {
                     "original": raw_str,
@@ -396,7 +441,6 @@ def parse_article_number(value: Any, number_format: Optional[str] = None) -> Dic
             seg_formats.append(b_fmt)
             continue
 
-        # Unbekanntes/ungueltiges Segment
         return {
             "original": raw_str,
             "short": raw_str,
@@ -435,31 +479,21 @@ def is_valid_wago_article(value: Any) -> bool:
 
 
 def to_short_article_number(value: Any) -> str:
-    """
-    Konvertiert eine WAGO-Artikelnummer in das Kurzformat (z. B. '0221-0412' -> '221-412').
-    Gibt bei nicht eindeutig konvertierbaren Werten den Originalwert zurueck.
-    """
+    """Konvertiert eine WAGO-Artikelnummer in das Kurzformat (z. B. '0221-0412' -> '221-412')."""
     return parse_article_number(value)["short"]
 
 
 def to_long_article_number(value: Any) -> str:
-    """
-    Konvertiert eine WAGO-Artikelnummer in das Langformat (z. B. '221-412' -> '0221-0412').
-    Gibt bei nicht eindeutig konvertierbaren Werten den Originalwert zurueck.
-    """
+    """Konvertiert eine WAGO-Artikelnummer in das Langformat (z. B. '221-412' -> '0221-0412')."""
     return parse_article_number(value)["long"]
 
 
-# Kompakte Funktions-Aliase
 to_short_format = to_short_article_number
 to_long_format  = to_long_article_number
 
 
 def normalize_article_number(value: Any) -> str:
-    """
-    Normalisiert eine WAGO-Artikelnummer auf ihre kanonische Darstellung (Kurzformat)
-    fuer zuverlässige API-Abfragen und Deduplizierung.
-    """
+    """Normalisiert eine WAGO-Artikelnummer auf ihre kanonische Darstellung (Kurzformat)."""
     return parse_article_number(value)["canonical"]
 
 
@@ -471,7 +505,10 @@ def convert_article_number(value: Any) -> Tuple[str, str]:
 
 # Isoliertes Offline-Datenmodul (Q4 2026 Snapshot) importieren
 from offline_pcf_data import (  # noqa: E402
+    DEFAULT_OFFLINE_PCF_UNIT,
     EMBEDDED_PCF_DATA,
+    OFFLINE_DATA_SOURCE_LABEL,
+    OFFLINE_EXCEL_HEADER_NOTE,
     OFFLINE_NOTICE_TEXT,
     OFFLINE_NOTICE_TITLE,
     OFFLINE_PORTAL_URL,
@@ -484,8 +521,22 @@ from offline_pcf_data import (  # noqa: E402
 
 register_article_parser(parse_article_number)
 
+from portfolio_coverage import (  # noqa: E402
+    ACTION_PUBLISHED,
+    ACTION_REVIEW_CALCULATION,
+    ACTION_REVIEW_PUBLICATION,
+    ACTION_TECH_INVESTIGATION,
+    CLASS_PCF_AVAILABLE_AAS,
+    CLASS_PCF_MISSING_BOTH,
+    CLASS_PCF_OFFLINE_ONLY,
+    CLASS_TECHNICAL_ERROR,
+    export_portfolio_coverage_excel,
+    extract_product_series,
+    run_portfolio_coverage_analysis,
+)
 
-# ── Struktur-agnostische Excel-Erkennung & -Verarbeitung ─────────────────────
+
+# ── Struktur-agnostische Excel-Erkennung & -Verarbeitung (.xlsx & .xls) ──────
 
 _PRIMARY_HEADER_PATTERNS = [
     re.compile(r"\barticle\s*(?:number|no\.?|nr\.?|id|code)?\b", re.I),
@@ -508,10 +559,7 @@ _LONG_HEADER_HINT  = re.compile(r"\b(?:long|lang|expanded|erweitert|ber\.?)\b", 
 
 
 def _score_column_header(col_name: Any) -> float:
-    """
-    Bewertet einen Spaltennamen als sekundaeres Signal (0.0 bis 0.15).
-    Komponenten-Spalten erhalten einen kleinen Abzug gegenueber Hauptartikel-Spalten.
-    """
+    """Bewertet einen Spaltennamen als sekundaeres Signal (0.0 bis 0.15)."""
     if col_name is None:
         return 0.0
     s = str(col_name).strip()
@@ -542,15 +590,12 @@ def _score_column_header(col_name: Any) -> float:
 
 
 def _evaluate_dataframe_columns(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Analysiert alle Spalten eines DataFrames inhaltsbasiert auf WAGO-Artikelnummern.
-    """
+    """Analysiert alle Spalten eines DataFrames inhaltsbasiert auf WAGO-Artikelnummern."""
     candidates: List[Dict[str, Any]] = []
     col_parsed_map: Dict[str, List[Dict[str, Any]]] = {}
 
     for col in df.columns:
         series = df[col]
-        # Falls doppelte Spaltennamen existieren und df[col] ein DataFrame ist, erste Spalte nehmen
         if isinstance(series, pd.DataFrame):
             series = series.iloc[:, 0]
 
@@ -579,13 +624,11 @@ def _evaluate_dataframe_columns(df: pd.DataFrame) -> Dict[str, Any]:
         match_ratio = valid_cnt / non_empty
         hyphen_ratio = explicit_hyphen_cnt / valid_cnt if valid_cnt > 0 else 0.0
 
-        # Konsistenz der Formate über die Zeilen hinweg
         short_compat = fmt_counts["short"] + fmt_counts["both"]
         long_compat  = fmt_counts["long"] + fmt_counts["both"]
         max_consistent = max(short_compat, long_compat, fmt_counts["numeric"], fmt_counts["mixed"])
         consistency = max_consistent / valid_cnt if valid_cnt > 0 else 0.0
 
-        # Dominantes Format bestimmen
         if fmt_counts["long"] > fmt_counts["short"] and fmt_counts["long"] >= fmt_counts["numeric"]:
             dom_fmt = "long"
         elif fmt_counts["short"] > 0 or fmt_counts["both"] > 0:
@@ -596,11 +639,6 @@ def _evaluate_dataframe_columns(df: pd.DataFrame) -> Dict[str, Any]:
             dom_fmt = "mixed"
 
         header_score = _score_column_header(col)
-
-        # Inhaltsbasierter Gesamt-Confidence-Score:
-        # - match_ratio ist das Hauptkriterium (bis 0.70)
-        # - Konsistenz + explizite Bindestrich-Struktur (bis 0.15)
-        # - Header-Signal als sekundaerer Tie-Breaker (bis 0.15)
         content_quality = 0.85 + 0.15 * hyphen_ratio
         confidence = (
             0.70 * match_ratio * content_quality
@@ -620,7 +658,6 @@ def _evaluate_dataframe_columns(df: pd.DataFrame) -> Dict[str, Any]:
             "header_score": header_score,
         })
 
-    # Sortiere Kandidaten absteigend nach Confidence, dann valid_count, dann match_ratio
     candidates.sort(
         key=lambda c: (c["confidence"], c["valid_count"], c["match_ratio"], c["header_score"]),
         reverse=True,
@@ -644,8 +681,6 @@ def _evaluate_dataframe_columns(df: pd.DataFrame) -> Dict[str, Any]:
     has_both_formats = False
     is_ambiguous = False
 
-    # Pruefe, ob die Top-Kandidaten ein zusammengehoeriges (Short, Long)-Spaltenpaar
-    # fuer dieselben Produkte bilden oder ob konkurrierende Spalten vorliegen.
     if len(candidates) >= 2:
         second = candidates[1]
         c1_name = str(best["column"])
@@ -663,7 +698,6 @@ def _evaluate_dataframe_columns(df: pd.DataFrame) -> Dict[str, Any]:
 
         same_product_ratio = (same_product_rows / both_valid_rows) if both_valid_rows > 0 else 0.0
 
-        # Wenn zwei Spalten dieselben Produkte darstellen (eine Short, eine Long)
         if both_valid_rows > 0 and same_product_ratio >= 0.80:
             has_both_formats = True
             c1_is_long = (
@@ -678,8 +712,6 @@ def _evaluate_dataframe_columns(df: pd.DataFrame) -> Dict[str, Any]:
                 short_col = best["column"]
                 long_col  = second["column"]
         else:
-            # Verschiedene Artikelnummern in mehreren plausiblen Spalten:
-            # Ambiguitaet liegt vor, wenn beide hohe Match-Ratio haben und die Scores sehr nah sind.
             score_diff = best["confidence"] - second["confidence"]
             if second["match_ratio"] >= 0.50 and score_diff < 0.08:
                 is_ambiguous = True
@@ -704,7 +736,7 @@ def _evaluate_dataframe_columns(df: pd.DataFrame) -> Dict[str, Any]:
 
 def _extract_sheet_rows_with_formats(ws: openpyxl.worksheet.worksheet.Worksheet) -> List[List[str]]:
     """
-    Liest alle Zeilen eines openpyxl-Worksheets und stellt durch Excel-Zahlenformatierung
+    Liest alle Zeilen eines openpyxl-Worksheets (.xlsx) und stellt durch Excel-Zahlenformatierung
     verlorene fuehrende Nullen anhand von cell.number_format wieder her.
     """
     rows: List[List[str]] = []
@@ -717,14 +749,12 @@ def _extract_sheet_rows_with_formats(ws: openpyxl.worksheet.worksheet.Worksheet)
                 continue
             num_fmt = getattr(cell, "number_format", None)
             if isinstance(val, (int, float)):
-                # Integer-Wert (auch 2210412.0)
                 if isinstance(val, float) and val.is_integer():
                     val = int(val)
                 if isinstance(val, int):
                     s_int = str(val)
                     p = parse_article_number(s_int, number_format=num_fmt)
                     if p["is_valid"] and p["format"] == "numeric":
-                        # Wenn das Zahlenformat 0000-0000 ist, Langformat, sonst Kurzformat/Original
                         if num_fmt and "0000" in str(num_fmt):
                             row_vals.append(p["long"])
                         else:
@@ -739,6 +769,60 @@ def _extract_sheet_rows_with_formats(ws: openpyxl.worksheet.worksheet.Worksheet)
     return rows
 
 
+def _extract_xls_sheet_rows_with_formats(sheet: Any, book: Any) -> List[List[str]]:
+    """
+    Liest alle Zeilen eines Legacy-Excel-Worksheets (.xls via xlrd) und stellt
+    durch Zahlenformatierung verlorene fuehrende Nullen wieder her.
+    """
+    rows: List[List[str]] = []
+    for r_idx in range(sheet.nrows):
+        row_vals: List[str] = []
+        for c_idx in range(sheet.ncols):
+            cell = sheet.cell(r_idx, c_idx)
+            ctype = cell.ctype
+            val = cell.value
+
+            if ctype in (0, 6) or val is None:  # XL_CELL_EMPTY, XL_CELL_BLANK
+                row_vals.append("")
+                continue
+
+            num_fmt = None
+            if getattr(book, "formatting_info", False) and cell.xf_index is not None:
+                try:
+                    xf = book.xf_list[cell.xf_index]
+                    fmt_obj = book.format_map.get(xf.format_key)
+                    if fmt_obj:
+                        num_fmt = fmt_obj.format_str
+                except Exception:
+                    num_fmt = None
+
+            if ctype == 2:  # XL_CELL_NUMBER
+                if isinstance(val, float) and val.is_integer():
+                    s_int = str(int(val))
+                    p = parse_article_number(s_int, number_format=num_fmt)
+                    if p["is_valid"] and p["format"] == "numeric":
+                        if num_fmt and "0000" in str(num_fmt):
+                            row_vals.append(p["long"])
+                        else:
+                            row_vals.append(s_int)
+                    else:
+                        row_vals.append(s_int)
+                else:
+                    row_vals.append(str(val))
+            elif ctype == 3 and xlrd is not None:  # XL_CELL_DATE
+                try:
+                    dt = xlrd.xldate_as_datetime(val, book.datemode)
+                    row_vals.append(dt.strftime("%Y-%m-%d"))
+                except Exception:
+                    row_vals.append(str(val))
+            elif ctype == 4:  # XL_CELL_BOOLEAN
+                row_vals.append("TRUE" if val else "FALSE")
+            else:
+                row_vals.append(str(val).strip())
+        rows.append(row_vals)
+    return rows
+
+
 def _parse_sheet_table(rows: List[List[str]]) -> Tuple[pd.DataFrame, Optional[int], bool]:
     """
     Erkennt automatisch:
@@ -746,7 +830,7 @@ def _parse_sheet_table(rows: List[List[str]]) -> Tuple[pd.DataFrame, Optional[in
     - Ob eine Kopfzeile (Header Row) existiert oder ob die Tabelle direkt mit Daten beginnt
     Gibt (df, header_row_index, has_header) zurueck.
     """
-    # Entferne komplett leere Zeilen am Ende
+    rows = list(rows)
     while rows and all(c == "" for c in rows[-1]):
         rows.pop()
 
@@ -756,7 +840,6 @@ def _parse_sheet_table(rows: List[List[str]]) -> Tuple[pd.DataFrame, Optional[in
     max_cols = max(len(r) for r in rows)
     norm_rows = [r + [""] * (max_cols - len(r)) for r in rows]
 
-    # Finde die erste Zeile, die mindestens eine gueltige WAGO-Artikelnummer enthaelt
     first_article_row: Optional[int] = None
     for r_idx, r in enumerate(norm_rows):
         if any(is_valid_wago_article(cell) for cell in r):
@@ -764,7 +847,6 @@ def _parse_sheet_table(rows: List[List[str]]) -> Tuple[pd.DataFrame, Optional[in
             break
 
     if first_article_row is None:
-        # Keine WAGO-Artikelnummer im gesamten Sheet gefunden -> erste nicht-leere Zeile als Header
         for r_idx, r in enumerate(norm_rows):
             if any(c != "" for c in r):
                 headers = [c if c != "" else f"Unnamed: {i}" for i, c in enumerate(r)]
@@ -773,19 +855,17 @@ def _parse_sheet_table(rows: List[List[str]]) -> Tuple[pd.DataFrame, Optional[in
         return pd.DataFrame(), None, True
 
     if first_article_row == 0:
-        # Erste Zeile enthaelt bereits Artikelnummern -> Tabelle hat KEINE Header-Zeile!
         headers = [f"Column {i + 1}" for i in range(max_cols)]
         df = pd.DataFrame(norm_rows, columns=headers)
         return df, None, False
 
-    # Pruefe die Zeile direkt vor first_article_row als potenzielle Header-Zeile
     prev_row = norm_rows[first_article_row - 1]
     prev_non_empty = [c for c in prev_row if c != ""]
 
     if prev_non_empty and not any(is_valid_wago_article(c) for c in prev_row):
         header_row_idx = first_article_row - 1
         raw_headers = norm_rows[header_row_idx]
-        headers: List[str] = []
+        headers = []
         seen_counts: Dict[str, int] = {}
         for i, h in enumerate(raw_headers):
             base_h = h if h != "" else f"Unnamed: {i}"
@@ -799,11 +879,688 @@ def _parse_sheet_table(rows: List[List[str]]) -> Tuple[pd.DataFrame, Optional[in
         df = pd.DataFrame(data, columns=headers)
         return df, header_row_idx, True
     else:
-        # Zeile vor first_article_row ist leer -> Tabelle ab first_article_row ohne Header
         headers = [f"Column {i + 1}" for i in range(max_cols)]
         data = norm_rows[first_article_row:]
         df = pd.DataFrame(data, columns=headers)
         return df, None, False
+
+
+# ── Inhaltsbasierte Dateiformat-Erkennung & MHTML / HTML / XML Parser ────────
+
+_META_CHARSET_RE = re.compile(
+    rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)""",
+    re.I,
+)
+_XML_ENCODING_RE = re.compile(
+    rb"""<\?xml[^>]+encoding\s*=\s*["']([A-Za-z0-9_\-]+)["']""",
+    re.I,
+)
+
+
+def _decode_bytes_smart(raw_bytes: bytes, declared_charset: Optional[str] = None) -> str:
+    """
+    Dekodiert ein Byte-Array zuversichtlich unter Beachtung von BOMs, deklariertem
+    MIME/Meta/XML-Charset, UTF-8 und Windows-1252/ISO-8859-1-Fallback (fuer deutsche Umlaute).
+    """
+    if not raw_bytes:
+        return ""
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        return raw_bytes[3:].decode("utf-8", errors="replace")
+    if raw_bytes.startswith(b"\xff\xfe"):
+        return raw_bytes[2:].decode("utf-16-le", errors="replace")
+    if raw_bytes.startswith(b"\xfe\xff"):
+        return raw_bytes[2:].decode("utf-16-be", errors="replace")
+    if len(raw_bytes) >= 4 and raw_bytes[1:4:2] == b"\x00\x00" and raw_bytes[0] != 0:
+        try:
+            return raw_bytes.decode("utf-16-le")
+        except Exception:
+            pass
+
+    candidates: List[str] = []
+    if declared_charset:
+        c_clean = declared_charset.strip().strip("\"'").lower()
+        if c_clean:
+            candidates.append(c_clean)
+
+    m_meta = _META_CHARSET_RE.search(raw_bytes[:8192])
+    if m_meta:
+        try:
+            candidates.append(m_meta.group(1).decode("ascii", errors="ignore").lower())
+        except Exception:
+            pass
+
+    m_xml = _XML_ENCODING_RE.search(raw_bytes[:2048])
+    if m_xml:
+        try:
+            candidates.append(m_xml.group(1).decode("ascii", errors="ignore").lower())
+        except Exception:
+            pass
+
+    for enc in candidates:
+        try:
+            return raw_bytes.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+
+    try:
+        return raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw_bytes.decode("cp1252", errors="replace")
+
+
+def detect_excel_file_format(file_path: Union[str, Path]) -> str:
+    """
+    Erkennt das tatsaechliche interne Dateiformat anhand der Dateisignatur und des
+    Inhalts (unabhaengig von der Dateiendung .xls / .xlsx):
+      - 'xlsx'     : Natives Office Open XML Workbook (ZIP mit xl/)
+      - 'xls_biff' : Natives binaeres Legacy-Excel-Workbook (OLE2 / BIFF)
+      - 'mhtml'    : MHTML-basierter Excel-Export (MIME-Version / multipart/related, z. B. SAP)
+      - 'xml_2003' : Excel 2003 XML Spreadsheet (SpreadsheetML)
+      - 'html'     : HTML-basierter Excel-Export (<table>...</table>)
+      - 'unknown'  : Unbekanntes oder beschaedigtes Format
+    """
+    p = Path(file_path)
+    if not p.is_file():
+        return "unknown"
+
+    try:
+        with open(p, "rb") as fp:
+            head = fp.read(65536)
+    except Exception:
+        return "unknown"
+
+    if not head:
+        return "unknown"
+
+    # 1. ZIP / Office Open XML (.xlsx)
+    if head.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(p, "r") as zf:
+                names = set(zf.namelist())
+                if any(n.startswith("xl/") or n == "[Content_Types].xml" for n in names):
+                    return "xlsx"
+        except Exception:
+            return "unknown"
+        return "unknown"
+
+    # 2. OLE2 Compound Document / BIFF2-BIFF8 (.xls)
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") or (
+        len(head) >= 8
+        and head[:2] in (b"\x09\x00", b"\x09\x02", b"\x09\x04", b"\x09\x08")
+        and head[2:4] in (b"\x04\x00", b"\x06\x00", b"\x08\x00", b"\x10\x00")
+    ):
+        return "xls_biff"
+
+    # Dekodiere Text-Vorschau fuer textbasierte Enterprise-/SAP-Excel-Exporte
+    text_sample = _decode_bytes_smart(head).lstrip()
+    if not text_sample:
+        return "unknown"
+
+    text_lower = text_sample[:16384].lower()
+
+    # 3. MHTML (MIME HTML, z. B. SAP-Export mit 'MIME-Version: 1.0')
+    first_lines = text_sample[:4096]
+    if (
+        re.match(r"^(?:mime-version|from|subject|date|content-type|message-id)\s*:", first_lines, re.I | re.M)
+        and (
+            "mime-version:" in text_lower
+            or "multipart/related" in text_lower
+            or "content-transfer-encoding:" in text_lower
+            or "content-location:" in text_lower
+            or "application/vnd.ms-excel" in text_lower
+            or "<table" in text_lower
+            or "=3c" in text_lower
+        )
+    ):
+        return "mhtml"
+
+    # 4. Excel 2003 XML Spreadsheet (SpreadsheetML)
+    if (
+        "urn:schemas-microsoft-com:office:spreadsheet" in text_lower
+        or 'progid="excel.sheet"' in text_lower
+        or ("<workbook" in text_lower and ("<worksheet" in text_lower or "<ss:worksheet" in text_lower))
+        or ("<ss:workbook" in text_lower)
+    ):
+        return "xml_2003"
+
+    # 5. HTML-basierter Excel-Export
+    if "<table" in text_lower and ("<tr" in text_lower or "<td" in text_lower or "<th" in text_lower):
+        return "html"
+
+    return "unknown"
+
+
+class _HTMLTableExtractor(HTMLParser):
+    """
+    Robuster, verschachtelungssicherer HTML-Tabellen-Parser fuer MHTML- und HTML-Excel-Exporte.
+    - Unterstuetzt verschachtelte Layout-Tabellen (extrahiert nur echte Datentabellen).
+    - Unterstuetzt colspan und rowspan fuer exakte Spaltenausrichtung.
+    - Ignoriert <style>, <script>, <xml>, <head>, <title> und Kommentare.
+    - Bewahrt fuehrende Nullen und komplexe WAGO-Artikelnummern unveraendert als String.
+    """
+
+    _IGNORED_TAGS = {"style", "script", "xml", "head", "title", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignore_depth = 0
+        self._table_stack: List[Dict[str, Any]] = []
+        self.completed_tables: List[Dict[str, Any]] = []
+        self._sheet_names_from_xml: List[Tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        t = tag.lower()
+        if t in self._IGNORED_TAGS:
+            self._ignore_depth += 1
+            return
+        if self._ignore_depth > 0:
+            return
+
+        attr_map = {k.lower(): (v or "") for k, v in attrs if k}
+
+        if t == "table":
+            if self._table_stack:
+                self._table_stack[-1]["has_child_table"] = True
+            tbl_name = (
+                attr_map.get("data-sheet-name")
+                or attr_map.get("title")
+                or attr_map.get("id")
+                or ""
+            ).strip()
+            self._table_stack.append({
+                "name": tbl_name,
+                "caption": "",
+                "in_caption": False,
+                "has_child_table": False,
+                "rows": [],
+                "curr_row": None,
+                "in_cell": False,
+                "cell_buf": [],
+                "colspan": 1,
+                "rowspan": 1,
+            })
+        elif t == "caption" and self._table_stack:
+            self._table_stack[-1]["in_caption"] = True
+        elif t == "tr" and self._table_stack:
+            self._table_stack[-1]["curr_row"] = []
+        elif t in ("td", "th") and self._table_stack:
+            top = self._table_stack[-1]
+            if top["curr_row"] is None:
+                top["curr_row"] = []
+            try:
+                cs = max(1, min(200, int(attr_map.get("colspan", "1") or "1")))
+            except ValueError:
+                cs = 1
+            try:
+                rs = max(1, min(10000, int(attr_map.get("rowspan", "1") or "1")))
+            except ValueError:
+                rs = 1
+            top["in_cell"] = True
+            top["cell_buf"] = []
+            top["colspan"] = cs
+            top["rowspan"] = rs
+        elif t == "br" and self._table_stack and self._table_stack[-1]["in_cell"]:
+            self._table_stack[-1]["cell_buf"].append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in self._IGNORED_TAGS:
+            if self._ignore_depth > 0:
+                self._ignore_depth -= 1
+            return
+        if self._ignore_depth > 0:
+            return
+
+        if t in ("td", "th") and self._table_stack:
+            top = self._table_stack[-1]
+            if top["in_cell"] and top["curr_row"] is not None:
+                raw_txt = "".join(top["cell_buf"]).replace("\xa0", " ")
+                clean_txt = re.sub(r"[ \t\r\n]+", " ", raw_txt).strip()
+                top["curr_row"].append((clean_txt, top["colspan"], top["rowspan"]))
+            top["in_cell"] = False
+            top["cell_buf"] = []
+        elif t == "tr" and self._table_stack:
+            top = self._table_stack[-1]
+            if top["curr_row"] is not None:
+                top["rows"].append(top["curr_row"])
+            top["curr_row"] = None
+        elif t == "caption" and self._table_stack:
+            self._table_stack[-1]["in_caption"] = False
+        elif t == "table" and self._table_stack:
+            finished = self._table_stack.pop()
+            if finished["curr_row"]:
+                finished["rows"].append(finished["curr_row"])
+            grid = self._expand_spans_to_grid(finished["rows"])
+            if grid and not (finished["has_child_table"] and len(grid) <= 2):
+                self.completed_tables.append({
+                    "name": finished["caption"].strip() or finished["name"],
+                    "rows": grid,
+                    "has_child_table": finished["has_child_table"],
+                })
+
+    def handle_data(self, data: str) -> None:
+        if self._ignore_depth > 0:
+            return
+        if not self._table_stack:
+            return
+        top = self._table_stack[-1]
+        if top["in_cell"]:
+            top["cell_buf"].append(data)
+        elif top["in_caption"]:
+            top["caption"] += data
+
+    @staticmethod
+    def _expand_spans_to_grid(
+        raw_rows: List[List[Tuple[str, int, int]]]
+    ) -> List[List[str]]:
+        if not raw_rows:
+            return []
+        grid_map: Dict[Tuple[int, int], str] = {}
+        max_col = 0
+        total_r = len(raw_rows)
+
+        for r_idx, cell_tuples in enumerate(raw_rows):
+            c_idx = 0
+            for val, cs, rs in cell_tuples:
+                while (r_idx, c_idx) in grid_map:
+                    c_idx += 1
+                for dr in range(rs):
+                    for dc in range(cs):
+                        target_r = r_idx + dr
+                        target_c = c_idx + dc
+                        if target_r < total_r + rs:
+                            grid_map[(target_r, target_c)] = val if (dr == 0 and dc == 0) else ""
+                c_idx += cs
+                if c_idx > max_col:
+                    max_col = c_idx
+
+        if max_col == 0:
+            return []
+
+        out_rows: List[List[str]] = []
+        for r_idx in range(total_r):
+            row_vals = [grid_map.get((r_idx, c_idx), "") for c_idx in range(max_col)]
+            out_rows.append(row_vals)
+
+        while out_rows and all(c == "" for c in out_rows[-1]):
+            out_rows.pop()
+        return out_rows
+
+
+def _extract_tables_from_html_text(
+    html_text: str, default_sheet_prefix: str = "Sheet"
+) -> List[Tuple[str, List[List[str]]]]:
+    """Extrahiert alle relevanten Datentabellen aus einem HTML-Dokument als [(sheet_name, rows)]."""
+    extractor = _HTMLTableExtractor()
+    extractor.feed(html_text)
+    extractor.close()
+
+    tables = extractor.completed_tables
+    if not tables:
+        return []
+
+    # Bevorzuge Blatt-Tabellen ohne verschachtelte Kind-Tabellen
+    leaf_tables = [t for t in tables if not t["has_child_table"]]
+    candidates = leaf_tables if leaf_tables else tables
+
+    # Falls mehrere Tabellen vorhanden sind, ignoriere reine 1-Zellen-Banner/Layout-Tabellen
+    if len(candidates) > 1:
+        multi_cell = [
+            t for t in candidates
+            if len(t["rows"]) >= 2 or (t["rows"] and sum(1 for c in t["rows"][0] if c != "") >= 2)
+        ]
+        if multi_cell:
+            candidates = multi_cell
+
+    # Prüfe optionales <x:Name> oder <title> im HTML-Header als Fallback-Sheetname
+    doc_sheet_names = [
+        html.unescape(m.group(1)).strip()
+        for m in re.finditer(r"<(?:x:)?Name>\s*(.*?)\s*</(?:x:)?Name>", html_text, re.I | re.S)
+        if m.group(1).strip()
+    ]
+    doc_title = ""
+    m_title = re.search(r"<title[^>]*>\s*(.*?)\s*</title>", html_text, re.I | re.S)
+    if m_title:
+        doc_title = html.unescape(m_title.group(1)).strip()
+
+    result: List[Tuple[str, List[List[str]]]] = []
+    used_names: Set[str] = set()
+    for idx, tbl in enumerate(candidates, start=1):
+        fallback_doc_name = (
+            doc_sheet_names[idx - 1]
+            if idx - 1 < len(doc_sheet_names)
+            else (doc_title if len(candidates) == 1 and doc_title else "")
+        )
+        raw_name = tbl["name"] or fallback_doc_name or f"{default_sheet_prefix}{idx}"
+        # Bereinige unzulässige Excel-Sheet-Zeichen (: \ / ? * [ ])
+        clean_name = re.sub(r"[:\\/?*\[\]]+", "_", raw_name).strip()[:31] or f"{default_sheet_prefix}{idx}"
+        if clean_name in used_names:
+            clean_name = f"{clean_name[:27]}_{idx}"
+        used_names.add(clean_name)
+        result.append((clean_name, tbl["rows"]))
+
+    return result
+
+
+def _parse_html_sheets(file_path: str) -> List[Tuple[str, List[List[str]]]]:
+    """Liest einen HTML-basierten Excel-Export (.xls / .html) ein."""
+    raw_bytes = Path(file_path).read_bytes()
+    html_text = _decode_bytes_smart(raw_bytes)
+    sheets = _extract_tables_from_html_text(html_text)
+    if not sheets:
+        raise ValueError("No valid spreadsheet table found in HTML file.")
+    return sheets
+
+
+def _parse_mhtml_sheets(file_path: str) -> List[Tuple[str, List[List[str]]]]:
+    """
+    Liest einen MHTML-basierten Excel-Export (MIME / multipart/related, z. B. aus SAP)
+    ein, dekodiert quoted-printable / Base64 sowie den Zeichensatz jedes MIME-Parts
+    und extrahiert alle enthaltenen Worksheets in ihrer Originalreihenfolge.
+    """
+    raw_bytes = Path(file_path).read_bytes()
+
+    # Falls die MHTML-Datei komplett in UTF-16 gespeichert wurde, zuerst nach UTF-8 konvertieren
+    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")) or (
+        len(raw_bytes) >= 4 and raw_bytes[1:4:2] == b"\x00\x00"
+    ):
+        text_u16 = _decode_bytes_smart(raw_bytes)
+        raw_bytes = text_u16.encode("utf-8")
+    elif raw_bytes.startswith(b"\xef\xbb\xbf"):
+        raw_bytes = raw_bytes[3:]
+
+    # Entferne etwaige fuehrende Leerzeilen vor dem ersten MIME-Header
+    raw_bytes = raw_bytes.lstrip(b" \t\r\n")
+
+    msg = email.message_from_bytes(raw_bytes, policy=email_policy.compat32)
+
+    html_parts: List[Tuple[str, str]] = []  # [(content_location, decoded_html)]
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ctype = (part.get_content_type() or "").lower()
+        loc = (part.get("Content-Location") or part.get("Content-ID") or "").strip()
+        payload_bytes = part.get_payload(decode=True)
+        if not payload_bytes:
+            raw_payload = part.get_payload()
+            if isinstance(raw_payload, str) and raw_payload.strip():
+                payload_bytes = raw_payload.encode("utf-8", errors="replace")
+        if not payload_bytes:
+            continue
+
+        if ctype in ("text/html", "application/vnd.ms-excel", "text/plain", "text/xml") or (
+            b"<table" in payload_bytes.lower() or b"<x:excelworkbook" in payload_bytes.lower()
+        ):
+            declared_cs = part.get_content_charset()
+            decoded_text = _decode_bytes_smart(payload_bytes, declared_charset=declared_cs)
+            if "<table" in decoded_text.lower() or "<x:excelworksheet" in decoded_text.lower():
+                html_parts.append((loc, decoded_text))
+
+    # Fallback falls ein nicht-standardkonformer SAP-MHTML-Export ohne sauberen Boundary-Header vorliegt
+    if not html_parts:
+        raw_text = _decode_bytes_smart(raw_bytes)
+        if "quoted-printable" in raw_text[:2048].lower() or "=3c" in raw_text.lower() or "=3d" in raw_text.lower():
+            try:
+                qp_bytes = quopri.decodestring(raw_bytes)
+                decoded_qp = _decode_bytes_smart(qp_bytes)
+                if "<table" in decoded_qp.lower():
+                    html_parts.append(("", decoded_qp))
+            except Exception:
+                pass
+        if not html_parts and "<table" in raw_text.lower():
+            html_parts.append(("", raw_text))
+
+    if not html_parts:
+        raise ValueError("No HTML worksheet content found in MHTML file.")
+
+    # Pruefe, ob im Root-Part <x:ExcelWorksheet>-Definitionen mit Namen und HRef vorhanden sind
+    ws_href_to_name: List[Tuple[str, str]] = []
+    for _loc, h_txt in html_parts:
+        for m_ws in re.finditer(
+            r"<x:ExcelWorksheet[^>]*>(.*?)</x:ExcelWorksheet>", h_txt, re.I | re.S
+        ):
+            block = m_ws.group(1)
+            m_name = re.search(r"<x:Name[^>]*>(.*?)</x:Name>", block, re.I | re.S)
+            m_href = re.search(
+                r"""<x:WorksheetSource[^>]+HRef\s*=\s*["']?([^"'\s>]+)""", block, re.I
+            )
+            if m_name:
+                s_name = html.unescape(m_name.group(1)).strip()
+                s_href = m_href.group(1).strip() if m_href else ""
+                ws_href_to_name.append((s_href, s_name))
+
+    # Mappe Parts anhand des Dateinamens / Content-Location
+    sheets_out: List[Tuple[str, List[List[str]]]] = []
+    used_part_indices: Set[int] = set()
+
+    if ws_href_to_name and len(html_parts) > 1:
+        for idx_ws, (href, s_name) in enumerate(ws_href_to_name, start=1):
+            href_base = href.replace("\\", "/").split("/")[-1].lower() if href else ""
+            matched_idx: Optional[int] = None
+            if href_base:
+                for p_i, (loc, _ht) in enumerate(html_parts):
+                    loc_base = loc.replace("\\", "/").split("/")[-1].lower()
+                    if p_i not in used_part_indices and (loc_base == href_base or href_base in loc.lower()):
+                        matched_idx = p_i
+                        break
+            if matched_idx is not None:
+                used_part_indices.add(matched_idx)
+                extracted = _extract_tables_from_html_text(html_parts[matched_idx][1], default_sheet_prefix=s_name)
+                if extracted:
+                    clean_s = re.sub(r"[:\\/?*\[\]]+", "_", s_name).strip()[:31] or f"Sheet{idx_ws}"
+                    sheets_out.append((clean_s, extracted[0][1]))
+
+    # Extrahiere alle uebrigen HTML-Parts mit Datentabellen
+    for p_i, (_loc, h_txt) in enumerate(html_parts):
+        if p_i in used_part_indices:
+            continue
+        extracted = _extract_tables_from_html_text(h_txt, default_sheet_prefix="Sheet")
+        for s_name, rows in extracted:
+            if ws_href_to_name and len(sheets_out) < len(ws_href_to_name):
+                mapped_name = ws_href_to_name[len(sheets_out)][1]
+                s_name = re.sub(r"[:\\/?*\[\]]+", "_", mapped_name).strip()[:31] or s_name
+            sheets_out.append((s_name, rows))
+
+    if not sheets_out:
+        raise ValueError("MHTML file did not contain any extractable worksheet tables.")
+
+    # Eindeutige Sheet-Namen sicherstellen
+    final_sheets: List[Tuple[str, List[List[str]]]] = []
+    seen_names: Set[str] = set()
+    for idx, (s_name, rows) in enumerate(sheets_out, start=1):
+        unique_name = s_name
+        if unique_name in seen_names:
+            unique_name = f"{s_name[:27]}_{idx}"
+        seen_names.add(unique_name)
+        final_sheets.append((unique_name, rows))
+
+    return final_sheets
+
+
+def _local_xml_tag(tag: str) -> str:
+    """Entfernt den XML-Namespace-Teil aus einem ElementTree-Tag (z. B. '{urn:...}Worksheet' -> 'Worksheet')."""
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    if ":" in tag:
+        return tag.split(":", 1)[1]
+    return tag
+
+
+def _get_xml_attr(elem: ET.Element, local_name: str) -> Optional[str]:
+    """Liest ein XML-Attribut unabhaengig vom Namespace-Praefix (z. B. ss:Name, ss:Index)."""
+    target = local_name.lower()
+    for k, v in elem.attrib.items():
+        k_loc = k.split("}", 1)[1] if "}" in k else (k.split(":", 1)[1] if ":" in k else k)
+        if k_loc.lower() == target:
+            return v
+    return None
+
+
+def _parse_xml2003_sheets(file_path: str) -> List[Tuple[str, List[List[str]]]]:
+    """
+    Liest eine Excel 2003 XML Spreadsheet-Datei (SpreadsheetML, haeufig mit .xls-Endung)
+    ein und rekonstruiert alle Worksheets inkl. ss:Index-Versatz und MergeAcross/MergeDown.
+    """
+    raw_bytes = Path(file_path).read_bytes()
+    xml_text = _decode_bytes_smart(raw_bytes).lstrip()
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise ValueError(f"Invalid Excel 2003 XML structure: {exc}") from exc
+
+    sheets_out: List[Tuple[str, List[List[str]]]] = []
+    ws_Idx = 0
+
+    for elem in root.iter():
+        if _local_xml_tag(elem.tag).lower() != "worksheet":
+            continue
+        ws_Idx += 1
+        raw_name = _get_xml_attr(elem, "Name") or f"Sheet{ws_Idx}"
+        clean_name = re.sub(r"[:\\/?*\[\]]+", "_", raw_name).strip()[:31] or f"Sheet{ws_Idx}"
+
+        # Suche <Table> innerhalb des <Worksheet>
+        table_elem = None
+        for child in elem.iter():
+            if _local_xml_tag(child.tag).lower() == "table":
+                table_elem = child
+                break
+        if table_elem is None:
+            continue
+
+        grid_map: Dict[Tuple[int, int], str] = {}
+        curr_r = 0
+        max_r = 0
+        max_c = 0
+
+        for row_el in table_elem:
+            if _local_xml_tag(row_el.tag).lower() != "row":
+                continue
+            r_idx_attr = _get_xml_attr(row_el, "Index")
+            if r_idx_attr and r_idx_attr.isdigit():
+                curr_r = max(curr_r, int(r_idx_attr) - 1)
+
+            curr_c = 0
+            for cell_el in row_el:
+                if _local_xml_tag(cell_el.tag).lower() != "cell":
+                    continue
+                c_idx_attr = _get_xml_attr(cell_el, "Index")
+                if c_idx_attr and c_idx_attr.isdigit():
+                    curr_c = int(c_idx_attr) - 1
+                else:
+                    while (curr_r, curr_c) in grid_map:
+                        curr_c += 1
+
+                merge_across = int(_get_xml_attr(cell_el, "MergeAcross") or "0")
+                merge_down   = int(_get_xml_attr(cell_el, "MergeDown") or "0")
+
+                cell_text = ""
+                for sub in cell_el:
+                    if _local_xml_tag(sub.tag).lower() in ("data", "ss:data"):
+                        cell_text = "".join(sub.itertext()).strip()
+                        break
+                if not cell_text:
+                    cell_text = "".join(cell_el.itertext()).strip()
+
+                for dr in range(merge_down + 1):
+                    for dc in range(merge_across + 1):
+                        grid_map[(curr_r + dr, curr_c + dc)] = cell_text if (dr == 0 and dc == 0) else ""
+
+                curr_c += merge_across + 1
+                if curr_c > max_c:
+                    max_c = curr_c
+
+            curr_r += 1
+            if curr_r > max_r:
+                max_r = curr_r
+
+        rows_list: List[List[str]] = []
+        for r_i in range(max_r):
+            rows_list.append([grid_map.get((r_i, c_i), "") for c_i in range(max_c)])
+        while rows_list and all(c == "" for c in rows_list[-1]):
+            rows_list.pop()
+
+        if rows_list:
+            sheets_out.append((clean_name, rows_list))
+
+    if not sheets_out:
+        raise ValueError("No valid worksheet data found in Excel 2003 XML file.")
+    return sheets_out
+
+
+def _open_xls_workbook(path_str: str) -> Any:
+    """Oeffnet eine binaere .xls-Datei mit xlrd (mit Fallback falls formatting_info nicht unterstuetzt wird)."""
+    if xlrd is None:
+        raise ImportError("xlrd package is required to read legacy .xls files.")
+    try:
+        return xlrd.open_workbook(path_str, formatting_info=True)
+    except Exception:
+        return xlrd.open_workbook(path_str)
+
+
+def _load_all_workbook_sheets_raw(
+    path_str: str,
+) -> Tuple[str, List[Tuple[str, List[List[str]]]]] :
+    """
+    Erkennt das interne Dateiformat inhaltsbasiert und extrahiert alle Worksheets als
+    (detected_format, [(sheet_name, rows), ...]).
+    Wirft bei nicht lesbaren oder beschaedigten Dateien einen klaren ValueError.
+    """
+    ext = os.path.splitext(path_str)[1].lower()
+    if ext not in (".xlsx", ".xls", ".xml", ".mht", ".mhtml", ".htm", ".html"):
+        raise ValueError(
+            f"Unsupported file extension '{ext}'. Please select an Excel file (.xlsx or .xls)."
+        )
+
+    if not os.path.isfile(path_str):
+        raise ValueError(f"File not found: {path_str}")
+
+    detected_fmt = detect_excel_file_format(path_str)
+
+    try:
+        if detected_fmt == "xlsx":
+            wb = openpyxl.load_workbook(path_str, data_only=True)
+            try:
+                sheets_data = [
+                    (s_name, _extract_sheet_rows_with_formats(wb[s_name]))
+                    for s_name in wb.sheetnames
+                ]
+            finally:
+                wb.close()
+            return "xlsx", sheets_data
+
+        if detected_fmt == "xls_biff":
+            book = _open_xls_workbook(path_str)
+            try:
+                sheets_data = [
+                    (s_name, _extract_xls_sheet_rows_with_formats(book.sheet_by_name(s_name), book))
+                    for s_name in book.sheet_names()
+                ]
+            finally:
+                if hasattr(book, "release_resources"):
+                    book.release_resources()
+            return "xls", sheets_data
+
+        if detected_fmt == "mhtml":
+            return "mhtml", _parse_mhtml_sheets(path_str)
+
+        if detected_fmt == "html":
+            return "html", _parse_html_sheets(path_str)
+
+        if detected_fmt == "xml_2003":
+            return "xml_2003", _parse_xml2003_sheets(path_str)
+
+    except Exception as exc:
+        print(f"[Excel Import Diagnostic] Failed to parse '{path_str}' (detected={detected_fmt}): {exc}")
+        raise ValueError(
+            f"The file '{os.path.basename(path_str)}' could not be read as a valid Excel workbook "
+            f"(detected format: {detected_fmt}). The file may be corrupted or in an unsupported format."
+        ) from exc
+
+    print(f"[Excel Import Diagnostic] Unrecognized file signature for '{path_str}'.")
+    raise ValueError(
+        f"The file '{os.path.basename(path_str)}' is not a valid or supported Excel workbook. "
+        f"Supported formats are native .xlsx, binary .xls, MHTML (.xls), HTML (.xls), and Excel 2003 XML (.xls)."
+    )
 
 
 def load_excel_flexible(
@@ -812,11 +1569,9 @@ def load_excel_flexible(
     article_column: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Laedt eine Excel-Datei oder ein DataFrame struktur-agnostisch und erkennt
-    automatisch das beste Worksheet, die Tabellen-Kopfzeile und die Artikelnummern-Spalte.
-
-    Rueckgabe:
-        (df, detection_info)
+    Laedt eine Excel-Datei (.xlsx, binaeres .xls, MHTML-.xls, HTML-.xls oder Excel 2003 XML)
+    oder ein DataFrame struktur-agnostisch und erkennt automatisch das beste Worksheet,
+    die Tabellen-Kopfzeile und die Artikelnummern-Spalte.
     """
     if isinstance(path_or_df, pd.DataFrame):
         df = path_or_df.copy()
@@ -830,23 +1585,22 @@ def load_excel_flexible(
         info["available_sheets"] = [info["sheet_name"]]
         info["header_row"] = 0
         info["has_header"] = True
+        info["file_format"] = "dataframe"
         return df, info
 
     path_str = str(path_or_df)
-    wb = openpyxl.load_workbook(path_str, data_only=True)
-    sheet_names = list(wb.sheetnames)
-
-    target_sheets = [sheet_name] if (sheet_name and sheet_name in sheet_names) else sheet_names
+    detected_fmt, all_sheets = _load_all_workbook_sheets_raw(path_str)
+    sheet_names = [s_name for s_name, _ in all_sheets]
+    sheet_map = dict(all_sheets)
+    target_sheets = [sheet_name] if (sheet_name and sheet_name in sheet_map) else sheet_names
 
     best_df: Optional[pd.DataFrame] = None
     best_info: Optional[Dict[str, Any]] = None
 
     for s_name in target_sheets:
-        ws = wb[s_name]
-        rows = _extract_sheet_rows_with_formats(ws)
+        rows = sheet_map[s_name]
         df_cand, header_row_idx, has_header = _parse_sheet_table(rows)
         if not df_cand.empty:
-            # Entferne komplett leere angehaengte Spalten ohne Header
             keep_cols = [
                 c for c in df_cand.columns
                 if not (str(c).startswith(("Unnamed:", "Column ")) and (df_cand[c] == "").all())
@@ -859,6 +1613,7 @@ def load_excel_flexible(
         info_cand["available_sheets"] = sheet_names
         info_cand["header_row"] = header_row_idx
         info_cand["has_header"] = has_header
+        info_cand["file_format"] = detected_fmt
 
         if best_info is None or (
             info_cand["confidence"],
@@ -869,8 +1624,6 @@ def load_excel_flexible(
         ):
             best_df = df_cand
             best_info = info_cand
-
-    wb.close()
 
     if best_df is None or best_info is None:
         return pd.DataFrame(), {
@@ -885,6 +1638,7 @@ def load_excel_flexible(
             "available_sheets": sheet_names,
             "header_row": None,
             "has_header": True,
+            "file_format": detected_fmt,
         }
 
     if article_column and article_column in best_df.columns:
@@ -899,9 +1653,7 @@ def detect_article_column(
     sheet_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Erkennt die Artikelnummern-Spalte in einer Excel-Datei oder einem DataFrame
-    und gibt ein Diagnose-Dict mit 'column', 'confidence', 'is_ambiguous',
-    'candidates', 'short_column', 'long_column' etc. zurueck.
+    Erkennt die Artikelnummern-Spalte in einer Excel-Datei (.xlsx / .xls) oder einem DataFrame.
     """
     _, info = load_excel_flexible(path_or_df, sheet_name=sheet_name)
     return info
@@ -915,9 +1667,7 @@ _thread_local = threading.local()
 
 
 def _get_session() -> requests.Session:
-    """
-    Gibt eine thread-lokale requests.Session mit Retry-Logik zurueck.
-    """
+    """Gibt eine thread-lokale requests.Session mit Retry-Logik zurueck."""
     if not hasattr(_thread_local, "session") or _thread_local.session is None:
         from requests.adapters import HTTPAdapter, Retry
         s = requests.Session()
@@ -931,7 +1681,7 @@ def _get_session() -> requests.Session:
         )
         s.mount("https://", HTTPAdapter(max_retries=retry))
         headers = {
-            "User-Agent": "WAGO-AAS-PCF-Query/2.0",
+            "User-Agent": "WAGO-AAS-PCF-Query/3.0",
             "Accept": "application/json",
         }
         if API_AUTH_TOKEN:
@@ -958,13 +1708,6 @@ def _get_last_error() -> str:
 def _jget(url: str, timeout: Tuple[int, int] = REQUEST_TIMEOUT) -> Any:
     """
     HTTP GET -> JSON-Dict, _NOT_FOUND (404), oder _ERROR (techn. Fehler).
-
-    Unterscheidung:
-        404              -> _NOT_FOUND  (Ressource im AAS nicht vorhanden)
-        401 / 403        -> _ERROR      (Authentifizierungsfehler)
-        Timeout          -> _ERROR      (Zeitueberschreitung)
-        5xx / sonst.     -> _ERROR      (Server-/Verbindungsfehler oder ungueltiges JSON)
-        Erfolg (200)     -> dict        (JSON-Antwort)
     """
     _set_last_error(INTERNAL_STATUS_QUERY_ERROR)
     try:
@@ -973,26 +1716,22 @@ def _jget(url: str, timeout: Tuple[int, int] = REQUEST_TIMEOUT) -> Any:
             return _NOT_FOUND
         if r.status_code in (401, 403):
             _set_last_error(INTERNAL_STATUS_AUTH_ERROR)
-            print(f"  Warning: HTTP {r.status_code} (Authentication error) fuer {url}")
             return _ERROR
         if r.status_code >= 500:
             _set_last_error(INTERNAL_STATUS_SERVER_ERROR)
-            print(f"  Warning: HTTP {r.status_code} (Server error) fuer {url}")
             return _ERROR
         r.raise_for_status()
         try:
             data = r.json()
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError):
             _set_last_error(INTERNAL_STATUS_INVALID_RESP)
-            print(f"  Warning: Ungueltige JSON-Antwort fuer {url}: {str(e)[:100]}")
             return _ERROR
         if not isinstance(data, dict):
             _set_last_error(INTERNAL_STATUS_INVALID_RESP)
             return _ERROR
         return data
-    except requests.exceptions.Timeout as e:
+    except requests.exceptions.Timeout:
         _set_last_error(INTERNAL_STATUS_TIMEOUT)
-        print(f"  Warning: Timeout ({type(e).__name__}) fuer {url}")
         return _ERROR
     except requests.exceptions.HTTPError as e:
         code = getattr(e.response, "status_code", None)
@@ -1002,23 +1741,17 @@ def _jget(url: str, timeout: Tuple[int, int] = REQUEST_TIMEOUT) -> Any:
             _set_last_error(INTERNAL_STATUS_SERVER_ERROR)
         else:
             _set_last_error(INTERNAL_STATUS_QUERY_ERROR)
-        print(f"  Warning: HTTP {code} fuer {url}")
         return _ERROR
-    except requests.RequestException as e:
+    except requests.RequestException:
         _set_last_error(INTERNAL_STATUS_QUERY_ERROR)
-        print(f"  Warning: {type(e).__name__}: {str(e)[:100]}")
         return _ERROR
-    except (ValueError, TypeError) as e:
+    except (ValueError, TypeError):
         _set_last_error(INTERNAL_STATUS_INVALID_RESP)
-        print(f"  Warning: JSON-Fehler: {str(e)[:100]}")
         return _ERROR
 
 
 def _safe_jget(url: str, timeout: Tuple[int, int] = REQUEST_TIMEOUT) -> Any:
-    """
-    Wrapper um _jget(), der auch direkt geworfene Exceptions (z. B. bei gemocktem _jget
-    in Unit-Tests) sauber in _ERROR + Diagnosegrund uebersetzt.
-    """
+    """Wrapper um _jget() fuer konsistente Exception-Behandlung."""
     try:
         return _jget(url, timeout=timeout)
     except requests.exceptions.Timeout:
@@ -1041,7 +1774,7 @@ def _safe_jget(url: str, timeout: Tuple[int, int] = REQUEST_TIMEOUT) -> Any:
         return _ERROR
 
 
-# ── AAS-Hilfsfunktionen ──────────────────────────────────────────────────────
+# ── AAS-Hilfsfunktionen & PCF-Einheitenlogik ─────────────────────────────────
 
 def _b64_encode(value: str) -> str:
     """Base64-Encoding fuer AAS-Identifier in Pfaden."""
@@ -1060,23 +1793,14 @@ def _submodel_url_from_id(submodel_id: str) -> str:
 
 
 def _submodel_url(article_number: str) -> str:
-    """
-    Konstruiert die direkte AAS-Submodel-URL fuer das CarbonFootprint-Submodel
-    der gegebenen (normalisierten) Artikelnummer.
-
-    URL-Muster (SmartService AAS API v3.2):
-        ID      : https://www.wago.com/submodel/{article_short}/CarbonFootprint
-        Endpoint: {AAS_ENV_BASE}/submodels/{base64(ID)}
-    """
+    """Konstruiert die direkte AAS-Submodel-URL fuer das CarbonFootprint-Submodel."""
     canonical = normalize_article_number(article_number)
     submodel_id = SUBMODEL_ID_TEMPLATE.format(article=canonical)
     return _submodel_url_from_id(submodel_id)
 
 
 def _registry_lookup_url(article_number: str) -> str:
-    """
-    Konstruiert die Shell-Registry-Lookup-URL ueber globalAssetId (AAS v3.2 Objektformat).
-    """
+    """Konstruiert die Shell-Registry-Lookup-URL ueber globalAssetId (AAS v3.2 Objektformat)."""
     canonical = normalize_article_number(article_number)
     asset_id = ASSET_ID_TEMPLATE.format(article=canonical)
     asset_id_obj = {"name": "globalAssetId", "value": asset_id}
@@ -1088,8 +1812,6 @@ def _extract_all_values(elements: Any, path: str = "") -> Dict[str, Any]:
     """
     Traversiert rekursiv alle submodelElements (inkl. SubmodelElementList und
     SubmodelElementCollection) und gibt ein Dict {Pfad: Wert} zurueck.
-
-    Kompatibel mit AAS v3.0 / v3.2 (SubmodelElementList ohne idShort bei Listenelementen).
     """
     result: Dict[str, Any] = {}
     if not isinstance(elements, list):
@@ -1126,67 +1848,110 @@ def _parse_float(raw: Any) -> Optional[float]:
         return None
 
 
-# ── Kernfunktionen (PCF-Evaluation & API-Abfrage) ────────────────────────────
+def _derive_pcf_unit(
+    all_values: Dict[str, Any],
+) -> Tuple[str, str, Optional[float]]:
+    """
+    Bestimmt die korrekte PCF-Einheit und Bezugsgroesse aus den extrahierten
+    Submodel-Elementen (IDTA 02023 CarbonFootprint Submodel).
 
-def _evaluate_pcf_result_detailed(result: Any) -> Tuple[Optional[float], str, str]:
+    - Standard bei ReferenceImpactUnitForCalculation='piece' und Quantity=1:
+      ('kg CO2e', 'piece', 1.0)
+    - Falls eine abweichende Bezugseinheit (z. B. 'kg', 'm') oder Menge (!= 1)
+      angegeben ist, wird diese explizit in der Einheit ausgewiesen, ohne den
+      Zahlenwert stillschweigend umzurechnen (z. B. 'kg CO2e / kg', 'kg CO2e / 100 piece').
+    """
+    ref_unit_raw = ""
+    ref_qty_val: Optional[float] = None
+    explicit_unit = ""
+
+    for path, value in all_values.items():
+        pl = path.lower()
+        if "referenceimpactunitforcalculation" in pl and value is not None:
+            ref_unit_raw = str(value).strip()
+        elif "quantityofmeasureforcalculation" in pl and value is not None:
+            ref_qty_val = _parse_float(value)
+        elif pl.endswith("/pcfunit") or pl == "pcfunit":
+            if value is not None and str(value).strip():
+                explicit_unit = str(value).strip()
+
+    base_emission_unit = explicit_unit if explicit_unit else DEFAULT_PCF_UNIT
+    ref_unit_norm = ref_unit_raw.lower()
+    is_single_qty = ref_qty_val is None or abs(ref_qty_val - 1.0) < 1e-9
+    is_piece_unit = ref_unit_norm in ("", "piece", "pieces", "pc", "pcs", "item", "items", "stueck", "stück", "stk")
+
+    if is_piece_unit and is_single_qty:
+        return base_emission_unit, (ref_unit_raw or "piece"), (ref_qty_val if ref_qty_val is not None else 1.0)
+
+    if not is_single_qty and ref_qty_val is not None:
+        qty_str = str(int(ref_qty_val)) if float(ref_qty_val).is_integer() else str(ref_qty_val)
+        u_str = ref_unit_raw or "piece"
+        return f"{base_emission_unit} / {qty_str} {u_str}", u_str, ref_qty_val
+
+    return f"{base_emission_unit} / {ref_unit_raw}", ref_unit_raw, (ref_qty_val if ref_qty_val is not None else 1.0)
+
+
+def _evaluate_pcf_and_unit_detailed(
+    result: Any,
+) -> Tuple[Optional[float], str, str, str]:
     """
     Wertet eine Submodel-API-Antwort aus und gibt
-    (pcf_value, customer_status, internal_status) zurueck.
+    (pcf_value, pcf_unit, customer_status, internal_status) zurueck.
     """
     if result is _NOT_FOUND:
-        return None, STATUS_NOT_YET_AVAILABLE, INTERNAL_STATUS_NOT_FOUND
+        return None, "", STATUS_NOT_YET_AVAILABLE, INTERNAL_STATUS_NOT_FOUND
 
     if result is _ERROR:
-        return None, STATUS_QUERY_ERROR, _get_last_error()
+        return None, "", STATUS_QUERY_ERROR, _get_last_error()
 
     if not isinstance(result, dict):
-        return None, STATUS_QUERY_ERROR, INTERNAL_STATUS_INVALID_RESP
+        return None, "", STATUS_QUERY_ERROR, INTERNAL_STATUS_INVALID_RESP
 
-    # Pruefe, ob die Antwort eine valide AAS-Submodel-Struktur besitzt
     has_sm_elements = "submodelElements" in result and isinstance(result.get("submodelElements"), list)
     is_submodel_type = result.get("modelType") == "Submodel" and (
         result.get("submodelElements") is None or isinstance(result.get("submodelElements"), list)
     )
     if not has_sm_elements and not is_submodel_type:
-        return None, STATUS_QUERY_ERROR, INTERNAL_STATUS_INVALID_RESP
+        return None, "", STATUS_QUERY_ERROR, INTERNAL_STATUS_INVALID_RESP
 
     all_values = _extract_all_values(result.get("submodelElements") or [])
     for path, value in all_values.items():
         if "pcfco2eq" in path.lower():
             parsed = _parse_float(value)
             if parsed is not None:
-                return parsed, STATUS_PCF_AVAILABLE, INTERNAL_STATUS_PCF_AVAILABLE
+                unit_str, _, _ = _derive_pcf_unit(all_values)
+                return parsed, unit_str, STATUS_PCF_AVAILABLE, INTERNAL_STATUS_PCF_AVAILABLE
 
-    return None, STATUS_NOT_YET_AVAILABLE, INTERNAL_STATUS_AAS_NO_PCF
+    return None, "", STATUS_NOT_YET_AVAILABLE, INTERNAL_STATUS_AAS_NO_PCF
+
+
+def _evaluate_pcf_result_detailed(result: Any) -> Tuple[Optional[float], str, str]:
+    """Gibt (pcf_value, customer_status, internal_status) zurueck."""
+    pcf_val, _, cust_status, int_status = _evaluate_pcf_and_unit_detailed(result)
+    return pcf_val, cust_status, int_status
 
 
 def _evaluate_pcf_result(result: Any) -> Tuple[Optional[float], str]:
-    """
-    Gibt (pcf_value, customer_status) fuer eine Submodel-Antwort zurueck.
-    """
-    pcf_val, cust_status, _ = _evaluate_pcf_result_detailed(result)
+    """Gibt (pcf_value, customer_status) fuer eine Submodel-Antwort zurueck."""
+    pcf_val, _, cust_status, _ = _evaluate_pcf_and_unit_detailed(result)
     return pcf_val, cust_status
 
 
 def get_pcf_result(article_number: Any) -> Dict[str, Any]:
     """
-    Gibt ein Dict mit PCF-Wert, kundenfreundlichem Status, internem Diagnosestatus
-    sowie Kurz-/Langformat der Artikelnummer zurueck.
-
-    Nutzt:
-    1. Automatische Normalisierung auf das WAGO-Kurzformat (damit '221-412' und
-       '0221-0412' identisch aufgeloest werden).
-    2. 'Fast Path' (direkter Abruf des CarbonFootprint-Submodels).
-    3. 'Safe Fallback' (Shell-Descriptor-Lookup ueber globalAssetId).
+    Gibt ein Dict mit PCF-Wert, PCF-Einheit, kundenfreundlichem Status,
+    internem Diagnosestatus sowie Kurz-/Langformat der Artikelnummer zurueck.
     """
     parsed_art = parse_article_number(article_number)
     if not parsed_art["original"]:
         return {
             "pcf": None,
+            "unit": "",
             "status": STATUS_NOT_YET_AVAILABLE,
             "internal_status": INTERNAL_STATUS_NOT_FOUND,
             "article_short": "",
             "article_long": "",
+            "source": "WAGO AAS API",
         }
 
     query_article = parsed_art["canonical"]
@@ -1197,25 +1962,27 @@ def get_pcf_result(article_number: Any) -> Dict[str, Any]:
     url = _submodel_url(query_article)
     fast_result = _safe_jget(url)
 
-    pcf_val, pcf_status, internal_status = _evaluate_pcf_result_detailed(fast_result)
+    pcf_val, pcf_unit, pcf_status, internal_status = _evaluate_pcf_and_unit_detailed(fast_result)
     if pcf_status == STATUS_PCF_AVAILABLE:
         return {
             "pcf": pcf_val,
+            "unit": pcf_unit,
             "status": STATUS_PCF_AVAILABLE,
             "internal_status": INTERNAL_STATUS_PCF_AVAILABLE,
             "article_short": short_art,
             "article_long": long_art,
+            "source": "WAGO AAS API",
         }
 
-    # Technische Fehler (Timeout, Auth-Fehler, Server-Fehler, ungueltige Response)
-    # duerfen NICHT als "Not yet available" fehlinterpretiert werden.
     if pcf_status == STATUS_QUERY_ERROR:
         return {
             "pcf": None,
+            "unit": "",
             "status": STATUS_QUERY_ERROR,
             "internal_status": internal_status,
             "article_short": short_art,
             "article_long": long_art,
+            "source": "WAGO AAS API",
         }
 
     # 2. Safe Fallback: Shell-Descriptor-Lookup via globalAssetId
@@ -1225,28 +1992,34 @@ def get_pcf_result(article_number: Any) -> Dict[str, Any]:
     if reg_res is _ERROR:
         return {
             "pcf": None,
+            "unit": "",
             "status": STATUS_QUERY_ERROR,
             "internal_status": _get_last_error(),
             "article_short": short_art,
             "article_long": long_art,
+            "source": "WAGO AAS API",
         }
 
     if reg_res is _NOT_FOUND:
         return {
             "pcf": None,
+            "unit": "",
             "status": STATUS_NOT_YET_AVAILABLE,
             "internal_status": INTERNAL_STATUS_NOT_FOUND,
             "article_short": short_art,
             "article_long": long_art,
+            "source": "WAGO AAS API",
         }
 
     if not isinstance(reg_res, dict):
         return {
             "pcf": None,
+            "unit": "",
             "status": STATUS_QUERY_ERROR,
             "internal_status": INTERNAL_STATUS_INVALID_RESP,
             "article_short": short_art,
             "article_long": long_art,
+            "source": "WAGO AAS API",
         }
 
     if isinstance(reg_res.get("result"), list):
@@ -1256,22 +2029,25 @@ def get_pcf_result(article_number: Any) -> Dict[str, Any]:
     else:
         return {
             "pcf": None,
+            "unit": "",
             "status": STATUS_QUERY_ERROR,
             "internal_status": INTERNAL_STATUS_INVALID_RESP,
             "article_short": short_art,
             "article_long": long_art,
+            "source": "WAGO AAS API",
         }
 
     if not shells:
         return {
             "pcf": None,
+            "unit": "",
             "status": STATUS_NOT_YET_AVAILABLE,
             "internal_status": internal_status,
             "article_short": short_art,
             "article_long": long_art,
+            "source": "WAGO AAS API",
         }
 
-    # Shell existiert im AAS -> Submodel-Descriptoren nach PCF / CarbonFootprint durchsuchen
     for shell in shells:
         if not isinstance(shell, dict):
             continue
@@ -1294,38 +2070,41 @@ def get_pcf_result(article_number: Any) -> Dict[str, Any]:
                 if sm_id:
                     sm_url = _submodel_url_from_id(sm_id)
                     sm_res = _safe_jget(sm_url, timeout=(10, 30))
-                    fb_val, fb_status, fb_internal = _evaluate_pcf_result_detailed(sm_res)
+                    fb_val, fb_unit, fb_status, fb_internal = _evaluate_pcf_and_unit_detailed(sm_res)
                     if fb_status == STATUS_PCF_AVAILABLE:
                         return {
                             "pcf": fb_val,
+                            "unit": fb_unit,
                             "status": STATUS_PCF_AVAILABLE,
                             "internal_status": INTERNAL_STATUS_PCF_AVAILABLE,
                             "article_short": short_art,
                             "article_long": long_art,
+                            "source": "WAGO AAS API",
                         }
                     if fb_status == STATUS_QUERY_ERROR:
                         return {
                             "pcf": None,
+                            "unit": "",
                             "status": STATUS_QUERY_ERROR,
                             "internal_status": fb_internal,
                             "article_short": short_art,
                             "article_long": long_art,
+                            "source": "WAGO AAS API",
                         }
 
-    # Shell ist vorhanden, aber kein PCF-Submodel / kein PCF-Wert hinterlegt
     return {
         "pcf": None,
+        "unit": "",
         "status": STATUS_NOT_YET_AVAILABLE,
         "internal_status": INTERNAL_STATUS_AAS_NO_PCF,
         "article_short": short_art,
         "article_long": long_art,
+        "source": "WAGO AAS API",
     }
 
 
 def get_pcf(article_number: Any) -> Optional[float]:
-    """
-    Rueckwaerts-kompatibler Wrapper: gibt nur den PCF-Wert (float | None) zurueck.
-    """
+    """Rueckwaerts-kompatibler Wrapper: gibt nur den PCF-Wert (float | None) zurueck."""
     return get_pcf_result(article_number)["pcf"]
 
 
@@ -1345,10 +2124,12 @@ def _query_with_timing(article_number: str, mode: str = MODE_ONLINE) -> Dict[str
         parsed = parse_article_number(article_number)
         res = {
             "pcf": None,
+            "unit": "",
             "status": STATUS_QUERY_ERROR,
             "internal_status": INTERNAL_STATUS_QUERY_ERROR,
             "article_short": parsed["short"],
             "article_long": parsed["long"],
+            "source": "WAGO AAS API",
         }
     dur = time.perf_counter() - t0
     if dur >= SLOW_REQUEST_THRESHOLD:
@@ -1357,7 +2138,85 @@ def _query_with_timing(article_number: str, mode: str = MODE_ONLINE) -> Dict[str
     return res
 
 
-# ── Excel-Aufbereitung & Export ──────────────────────────────────────────────
+# ── Single Query Workflow (Section 6.1) ──────────────────────────────────────
+
+def query_single_article(article_number: Any, mode: str = MODE_ONLINE) -> Dict[str, Any]:
+    """
+    Fuehrt eine Einzelabfrage fuer eine WAGO-Artikelnummer im Online- oder Offline-Modus
+    durch und gibt ein strukturiertes Ergebnis-Dict fuer GUI und Zwischenablage zurueck.
+    """
+    active_mode = MODE_OFFLINE if str(mode).strip().lower() == MODE_OFFLINE else MODE_ONLINE
+    parsed = parse_article_number(article_number)
+    raw_input = parsed["original"]
+
+    if not raw_input:
+        return {
+            "article_input": "",
+            "article_short": "",
+            "article_long": "",
+            "pcf": None,
+            "pcf_display": STATUS_NOT_YET_AVAILABLE,
+            "unit": "",
+            "status": STATUS_NOT_YET_AVAILABLE,
+            "internal_status": INTERNAL_STATUS_INVALID_ART,
+            "data_source": (
+                "WAGO AAS API (Online)"
+                if active_mode == MODE_ONLINE
+                else f"Embedded Snapshot ({OFFLINE_SNAPSHOT_VERSION} Offline)"
+            ),
+            "mode": active_mode,
+        }
+
+    res = _query_with_timing(raw_input, mode=active_mode)
+    pcf_val = res.get("pcf")
+    status  = res.get("status", STATUS_NOT_YET_AVAILABLE)
+
+    if pcf_val is not None:
+        pcf_display = str(pcf_val)
+        unit_str = res.get("unit") or DEFAULT_PCF_UNIT
+    elif status == STATUS_QUERY_ERROR:
+        pcf_display = STATUS_QUERY_ERROR
+        unit_str = ""
+    else:
+        pcf_display = STATUS_NOT_YET_AVAILABLE
+        unit_str = ""
+
+    return {
+        "article_input": raw_input,
+        "article_short": res.get("article_short") or parsed["short"],
+        "article_long": res.get("article_long") or parsed["long"],
+        "pcf": pcf_val,
+        "pcf_display": pcf_display,
+        "unit": unit_str,
+        "status": status,
+        "internal_status": res.get("internal_status", status),
+        "data_source": (
+            "WAGO AAS API (Online)"
+            if active_mode == MODE_ONLINE
+            else f"Embedded Snapshot ({OFFLINE_SNAPSHOT_VERSION} Offline)"
+        ),
+        "mode": active_mode,
+    }
+
+
+def format_single_result_for_clipboard(result: Dict[str, Any], value_only: bool = False) -> str:
+    """Formatiert ein Single-Query-Ergebnis fuer die Zwischenablage."""
+    if value_only:
+        if result.get("pcf") is not None:
+            return str(result["pcf"])
+        return str(result.get("pcf_display") or STATUS_NOT_YET_AVAILABLE)
+
+    lines = [
+        f"Article Number (Short): {result.get('article_short', '')}",
+        f"Article Number (Long):  {result.get('article_long', '')}",
+        f"PCF:                    {result.get('pcf_display', STATUS_NOT_YET_AVAILABLE)}",
+        f"PCF Unit:               {result.get('unit', '')}",
+        f"Data Source:            {result.get('data_source', '')}",
+    ]
+    return "\n".join(lines)
+
+
+# ── Excel-Aufbereitung & Standardisierter Export ('PCF Results' Worksheet) ───
 
 def _extract_row_articles(
     df: pd.DataFrame,
@@ -1367,9 +2226,6 @@ def _extract_row_articles(
     """
     Extrahiert fuer jede Zeile des DataFrames:
         (canonical_articles, short_articles, long_articles)
-
-    Wenn im Input bereits zwei zusammengehoerige Spalten (Short & Long) existieren,
-    werden beide wiederverwendet, gegeneinander validiert und fehlende Eintraege ergaenzt.
     """
     primary_col = article_column or detection_info.get("column")
     short_col   = detection_info.get("short_column")
@@ -1377,7 +2233,6 @@ def _extract_row_articles(
     has_both    = bool(detection_info.get("has_both_formats")) and not article_column
 
     if not has_both:
-        # Pruefe auch explizit benannte Spalten im DataFrame
         col_lookup = {str(c).strip().lower(): c for c in df.columns}
         if COL_ARTICLE_SHORT.lower() in col_lookup and COL_ARTICLE_LONG.lower() in col_lookup:
             short_col = col_lookup[COL_ARTICLE_SHORT.lower()]
@@ -1400,7 +2255,6 @@ def _extract_row_articles(
                     short_list.append(ps["short"])
                     long_list.append(pl["long"])
                 else:
-                    # Bei Widerspruch: primaere Spalte bevorzugen
                     p_main = ps if primary_col == short_col else pl
                     canonical_list.append(p_main["canonical"])
                     short_list.append(p_main["short"])
@@ -1445,93 +2299,451 @@ def prepare_output_dataframe(
     article_column: Optional[str] = None,
 ) -> pd.DataFrame:
     """
-    Erzeugt das Export-DataFrame:
-    - Bewahrt alle bestehenden Spalten und Originalwerte.
-    - Stellt sicher, dass sowohl 'Article Number (Short)' als auch 'Article Number (Long)'
-      vorhanden sind (wiederverwendet bestehende Spalten ohne Duplikate oder ergaenzt fehlende).
-    - Schreibt kundenfreundliche PCF-Werte und 'PCF Status' ('PCF available',
-      'Not yet available', 'Query error') ohne interne Diagnosegruende.
+    Erzeugt das standardisierte 4-spaltige Ergebnis-DataFrame fuer das Worksheet 'PCF Results':
+        | Article Number (Short) | Article Number (Long) | PCF | PCF Unit |
+
+    Hinweis:
+    - Keine separate 'PCF Status'-Spalte mehr (Section 2.2 & Section 4).
+    - Bei fehlendem PCF steht 'Not yet available' direkt in der PCF-Zelle und PCF Unit bleibt leer.
     """
-    out_df = df.copy()
-    primary_col = article_column or detection_info.get("column")
     canonical_list, short_list, long_list = _extract_row_articles(
-        out_df, detection_info, article_column=article_column
+        df, detection_info, article_column=article_column
     )
 
-    col_lookup = {str(c).strip().lower(): c for c in out_df.columns}
-    existing_short_col = col_lookup.get(COL_ARTICLE_SHORT.lower()) or detection_info.get("short_column")
-    existing_long_col  = col_lookup.get(COL_ARTICLE_LONG.lower()) or detection_info.get("long_column")
-
-    # Wenn im Input bereits ein zusammengehoeriges (Short, Long)-Paar unter anderen Namen existiert,
-    # validiere und vervollstaendige diese Spalten ebenfalls in-place.
-    if detection_info.get("has_both_formats") and not article_column:
-        s_col = detection_info.get("short_column")
-        l_col = detection_info.get("long_column")
-        if s_col in out_df.columns:
-            out_df[s_col] = short_list
-        if l_col in out_df.columns:
-            out_df[l_col] = long_list
-
-    # Bestimme Einfuegeposition fuer fehlende Short/Long-Spalten (direkt nach der Artikelspalte)
-    anchor_col = existing_short_col or primary_col
-    insert_pos = (
-        list(out_df.columns).index(anchor_col) + 1
-        if (anchor_col and anchor_col in out_df.columns)
-        else 0
-    )
-
-    # 1. Article Number (Short)
-    if COL_ARTICLE_SHORT in out_df.columns:
-        out_df[COL_ARTICLE_SHORT] = short_list
-    elif existing_short_col and str(existing_short_col).strip().lower() == COL_ARTICLE_SHORT.lower():
-        out_df.rename(columns={existing_short_col: COL_ARTICLE_SHORT}, inplace=True)
-        out_df[COL_ARTICLE_SHORT] = short_list
-    else:
-        out_df.insert(insert_pos, COL_ARTICLE_SHORT, short_list)
-        insert_pos += 1
-
-    # 2. Article Number (Long)
-    if COL_ARTICLE_LONG in out_df.columns:
-        out_df[COL_ARTICLE_LONG] = long_list
-    elif existing_long_col and str(existing_long_col).strip().lower() == COL_ARTICLE_LONG.lower():
-        out_df.rename(columns={existing_long_col: COL_ARTICLE_LONG}, inplace=True)
-        out_df[COL_ARTICLE_LONG] = long_list
-    else:
-        if COL_ARTICLE_SHORT in out_df.columns:
-            long_pos = list(out_df.columns).index(COL_ARTICLE_SHORT) + 1
-        else:
-            long_pos = insert_pos
-        out_df.insert(long_pos, COL_ARTICLE_LONG, long_list)
-
-    # 3. PCF & PCF Status berechnen
-    pcf_values: List[Any]   = []
-    pcf_statuses: List[str] = []
-
-    for canonical in canonical_list:
+    rows_out: List[Dict[str, Any]] = []
+    for canonical, short_val, long_val in zip(canonical_list, short_list, long_list):
         if not canonical:
-            pcf_values.append(STATUS_NOT_YET_AVAILABLE)
-            pcf_statuses.append("")
+            continue
+        res = cache.get(canonical, {"pcf": None, "unit": "", "status": STATUS_NOT_YET_AVAILABLE})
+        pcf_val = res.get("pcf")
+        if pcf_val is not None:
+            pcf_cell: Any = pcf_val
+            unit_cell = res.get("unit") or DEFAULT_PCF_UNIT
         else:
-            res = cache.get(canonical, {"pcf": None, "status": STATUS_QUERY_ERROR})
-            status = res.get("status", STATUS_QUERY_ERROR)
-            if res.get("pcf") is not None:
-                pcf_values.append(res["pcf"])
-                pcf_statuses.append(STATUS_PCF_AVAILABLE)
-            elif status == STATUS_QUERY_ERROR:
-                # Technischer Fehler darf nicht als "Not yet available" ausgegeben werden
-                pcf_values.append("")
-                pcf_statuses.append(STATUS_QUERY_ERROR)
-            else:
-                pcf_values.append(STATUS_NOT_YET_AVAILABLE)
-                pcf_statuses.append(STATUS_NOT_YET_AVAILABLE)
+            pcf_cell  = STATUS_NOT_YET_AVAILABLE
+            unit_cell = ""
 
-    out_df[COL_PCF]        = pcf_values
-    out_df[COL_PCF_STATUS] = pcf_statuses
+        rows_out.append({
+            COL_ARTICLE_SHORT: short_val,
+            COL_ARTICLE_LONG:  long_val,
+            COL_PCF:           pcf_cell,
+            COL_PCF_UNIT:      unit_cell,
+        })
 
-    return out_df
+    return pd.DataFrame(
+        rows_out,
+        columns=[COL_ARTICLE_SHORT, COL_ARTICLE_LONG, COL_PCF, COL_PCF_UNIT],
+    )
 
 
-# ── Hauptprogramm (Batch, ohne GUI) ──────────────────────────────────────────
+def _populate_pcf_results_worksheet(
+    ws: openpyxl.worksheet.worksheet.Worksheet,
+    results_df: pd.DataFrame,
+    mode: str = MODE_ONLINE,
+    export_timestamp: Optional[str] = None,
+) -> None:
+    """
+    Befuellt und formatiert das Worksheet 'PCF Results' im WAGO Corporate Design
+    inkl. Information Header (Zeilen 1-9) und Datentabelle (ab Zeile 11).
+    """
+    active_mode = MODE_OFFLINE if str(mode).strip().lower() == MODE_OFFLINE else MODE_ONLINE
+    ts_str = export_timestamp or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    total_queried = len(results_df)
+    available_cnt = sum(
+        1 for v in results_df[COL_PCF].tolist() if isinstance(v, (int, float))
+    ) if not results_df.empty else 0
+    missing_cnt = total_queried - available_cnt
+
+    if active_mode == MODE_OFFLINE:
+        source_str   = "Embedded Offline Dataset (WAGO PCF Query Tool)"
+        currency_str = f"Data snapshot: {OFFLINE_SNAPSHOT_VERSION}"
+        notice_str   = OFFLINE_EXCEL_HEADER_NOTE
+    else:
+        source_str   = "WAGO AAS API (retrieved from WAGO Asset Administration Shell at query time)"
+        currency_str = "Live query via WAGO SmartService AAS API (export timestamp is not the calculation date)"
+        notice_str   = "PCF values were retrieved from the WAGO AAS API at the time of the query. Current PCF values are available in the WAGO AAS Portal."
+
+    # Styles (WAGO Corporate Design)
+    c_anthracite    = "1F2837"
+    c_green         = "6EC800"
+    c_light_grey    = "EFF0F1"
+    c_anthracite_15 = "DEDFE1"
+    c_anthracite_70 = "616A73"
+    c_white         = "FFFFFF"
+
+    font_title = Font(name="Segoe UI", size=14, bold=True, color=c_white)
+    font_lbl   = Font(name="Segoe UI", size=10, bold=True, color=c_anthracite)
+    font_val   = Font(name="Segoe UI", size=10, color=c_anthracite)
+    font_note  = Font(name="Segoe UI", size=9, italic=True, color=c_anthracite_70)
+    font_link  = Font(name="Segoe UI", size=10, underline="single", color="0563C1")
+    font_thdr  = Font(name="Segoe UI", size=10, bold=True, color=c_white)
+    font_tcell = Font(name="Segoe UI", size=10, color=c_anthracite)
+
+    fill_title = PatternFill(start_color=c_anthracite, end_color=c_anthracite, fill_type="solid")
+    fill_info  = PatternFill(start_color=c_light_grey, end_color=c_light_grey, fill_type="solid")
+    fill_thdr  = PatternFill(start_color=c_green, end_color=c_green, fill_type="solid")
+    fill_zebra = PatternFill(start_color=c_light_grey, end_color=c_light_grey, fill_type="solid")
+
+    thin_border = Border(
+        left=Side(style="thin", color=c_anthracite_15),
+        right=Side(style="thin", color=c_anthracite_15),
+        top=Side(style="thin", color=c_anthracite_15),
+        bottom=Side(style="thin", color=c_anthracite_15),
+    )
+
+    # Row 1: Title Banner
+    ws.merge_cells("A1:D1")
+    c_banner = ws["A1"]
+    c_banner.value = "WAGO Product Carbon Footprint Data"
+    c_banner.font = font_title
+    c_banner.fill = fill_title
+    c_banner.alignment = Alignment(vertical="center", indent=1)
+    ws.row_dimensions[1].height = 28
+
+    # Rows 2-8: Information Header Fields
+    info_fields = [
+        ("Export Date & Time", ts_str),
+        ("Data Source", source_str),
+        ("Data Currency", currency_str),
+        ("Number of Queried Products", total_queried),
+        ("Products with Available PCF", available_cnt),
+        ("Products without Available PCF", missing_cnt),
+        ("WAGO AAS Portal", PORTAL_URL),
+    ]
+
+    for idx, (label, val) in enumerate(info_fields, start=2):
+        ws.merge_cells(start_row=idx, start_column=2, end_row=idx, end_column=4)
+        c_l = ws.cell(idx, 1, label)
+        c_v = ws.cell(idx, 2, val)
+        c_l.font = font_lbl
+        c_l.fill = fill_info
+        c_v.font = font_val
+        c_v.alignment = Alignment(horizontal="left", vertical="center")
+        if label == "WAGO AAS Portal":
+            c_v.hyperlink = PORTAL_URL
+            c_v.font = font_link
+        for col_i in range(1, 5):
+            ws.cell(idx, col_i).border = thin_border
+        ws.row_dimensions[idx].height = 19
+
+    # Row 9: Data Currency / Snapshot Notice
+    ws.merge_cells("A9:D9")
+    c_notice = ws["A9"]
+    c_notice.value = notice_str
+    c_notice.font = font_note
+    c_notice.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[9].height = 22
+
+    # Row 11: Table Headers
+    table_header_row = 11
+    headers = [COL_ARTICLE_SHORT, COL_ARTICLE_LONG, COL_PCF, COL_PCF_UNIT]
+    ws.row_dimensions[table_header_row].height = 24
+    for c_idx, h_name in enumerate(headers, start=1):
+        c_h = ws.cell(table_header_row, c_idx, h_name)
+        c_h.font = font_thdr
+        c_h.fill = fill_thdr
+        c_h.alignment = Alignment(horizontal="left", vertical="center")
+        c_h.border = thin_border
+
+    # Rows 12+: Table Data
+    for r_offset, (_, row_data) in enumerate(results_df.iterrows()):
+        r_idx = table_header_row + 1 + r_offset
+        is_even = r_offset % 2 == 1
+
+        # Col 1: Article Number (Short) - explicitly text
+        c1 = ws.cell(r_idx, 1, str(row_data[COL_ARTICLE_SHORT]))
+        c1.data_type = "s"
+        c1.number_format = "@"
+
+        # Col 2: Article Number (Long) - explicitly text
+        c2 = ws.cell(r_idx, 2, str(row_data[COL_ARTICLE_LONG]))
+        c2.data_type = "s"
+        c2.number_format = "@"
+
+        # Col 3: PCF - numeric float if available, else 'Not yet available'
+        pcf_val = row_data[COL_PCF]
+        c3 = ws.cell(r_idx, 3)
+        if isinstance(pcf_val, (int, float)) and not isinstance(pcf_val, bool):
+            c3.value = float(pcf_val)
+            c3.alignment = Alignment(horizontal="right", vertical="center")
+        else:
+            c3.value = str(pcf_val)
+            c3.data_type = "s"
+
+        # Col 4: PCF Unit - string unit if available, else empty
+        unit_val = row_data[COL_PCF_UNIT]
+        c4 = ws.cell(r_idx, 4, str(unit_val) if unit_val else "")
+        c4.data_type = "s"
+
+        for cell in (c1, c2, c3, c4):
+            cell.font = font_tcell
+            if is_even:
+                cell.fill = fill_zebra
+            cell.border = thin_border
+
+    if results_df.empty:
+        ws.cell(table_header_row + 1, 1, None)
+    last_row = max(table_header_row + len(results_df), table_header_row + 1)
+    ws.auto_filter.ref = f"A{table_header_row}:D{last_row}"
+    ws.freeze_panes = f"A{table_header_row + 1}"
+    if ws.views and ws.views.sheetView:
+        sv = ws.views.sheetView[0]
+        sv.tabSelected = True
+        if sv.selection:
+            sv.selection[0].activeCell = f"A{table_header_row + 1}"
+            sv.selection[0].sqref = f"A{table_header_row + 1}"
+
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["D"].width = 18
+
+
+def _copy_xls_sheets_to_openpyxl_workbook(
+    xls_path: str,
+    target_wb: openpyxl.Workbook,
+) -> None:
+    """
+    Kopiert alle Original-Worksheets einer Legacy-.xls-Datei inhalts- und strukturgetreu
+    in ein openpyxl-Workbook (Werte, Datentypen, zusammengefasste Zellen, Spaltenbreiten).
+    """
+    book = _open_xls_workbook(xls_path)
+    try:
+        for s_name in book.sheet_names():
+            sh = book.sheet_by_name(s_name)
+            # Falls der Name 'PCF Results' bereits vergeben ist, Original-Sheet-Namen bewahren
+            ws_title = s_name if s_name not in target_wb.sheetnames else f"{s_name} (Original)"
+            ws_out = target_wb.create_sheet(title=ws_title)
+
+            for r_idx in range(sh.nrows):
+                for c_idx in range(sh.ncols):
+                    cell = sh.cell(r_idx, c_idx)
+                    ctype = cell.ctype
+                    val = cell.value
+                    out_cell = ws_out.cell(r_idx + 1, c_idx + 1)
+
+                    if ctype in (0, 6) or val is None:
+                        out_cell.value = None
+                    elif ctype == 1:  # XL_CELL_TEXT
+                        out_cell.value = str(val)
+                        out_cell.data_type = "s"
+                        out_cell.number_format = "@"
+                    elif ctype == 2:  # XL_CELL_NUMBER
+                        if isinstance(val, float) and val.is_integer():
+                            out_cell.value = int(val)
+                        else:
+                            out_cell.value = float(val)
+                    elif ctype == 3 and xlrd is not None:  # XL_CELL_DATE
+                        try:
+                            out_cell.value = xlrd.xldate_as_datetime(val, book.datemode)
+                            out_cell.number_format = "yyyy-mm-dd"
+                        except Exception:
+                            out_cell.value = val
+                    elif ctype == 4:  # XL_CELL_BOOLEAN
+                        out_cell.value = bool(val)
+                    else:
+                        out_cell.value = str(val)
+
+            # Zusammengefasste Zellen uebernehmen (falls verfuegbar)
+            for rlo, rhi, clo, chi in getattr(sh, "merged_cells", []):
+                try:
+                    ws_out.merge_cells(
+                        start_row=rlo + 1,
+                        start_column=clo + 1,
+                        end_row=rhi,
+                        end_column=chi,
+                    )
+                except Exception:
+                    pass
+    finally:
+        if hasattr(book, "release_resources"):
+            book.release_resources()
+
+
+def _copy_parsed_text_sheets_to_openpyxl_workbook(
+    sheets_data: List[Tuple[str, List[List[str]]]],
+    target_wb: openpyxl.Workbook,
+) -> None:
+    """
+    Rekonstruiert die Original-Worksheets eines MHTML-, HTML- oder Excel-2003-XML-Exports
+    in einem openpyxl-Workbook (inkl. Erhalt fuehrender Nullen, Artikelnummern-Textformat '@',
+    Reihenfolge der Tabellenblaetter und Spaltenbreiten).
+    """
+    for s_name, rows in sheets_data:
+        ws_title = s_name if s_name not in target_wb.sheetnames else f"{s_name} (Original)"
+        ws_out = target_wb.create_sheet(title=ws_title[:31])
+        col_max_len: Dict[int, int] = {}
+
+        for r_idx, row_vals in enumerate(rows, start=1):
+            for c_idx, val in enumerate(row_vals, start=1):
+                s_val = str(val).strip() if val is not None else ""
+                out_cell = ws_out.cell(r_idx, c_idx)
+                if not s_val:
+                    out_cell.value = None
+                    continue
+
+                col_max_len[c_idx] = max(col_max_len.get(c_idx, 8), min(45, len(s_val) + 3))
+
+                # Bewahre Werte mit fuehrenden Nullen (z. B. '0221-0412', '0010') oder
+                # WAGO-Artikelnummern strikt als Text ('@'), damit keine Nullen verloren gehen
+                if (
+                    (len(s_val) > 1 and s_val.startswith("0") and not s_val.startswith(("0.", "0,")))
+                    or "-" in s_val
+                    or "/" in s_val
+                    or is_valid_wago_article(s_val)
+                ):
+                    out_cell.value = s_val
+                    out_cell.data_type = "s"
+                    out_cell.number_format = "@"
+                elif re.fullmatch(r"[+-]?\d+", s_val):
+                    try:
+                        out_cell.value = int(s_val)
+                    except ValueError:
+                        out_cell.value = s_val
+                        out_cell.data_type = "s"
+                elif re.fullmatch(r"[+-]?\d+\.\d+", s_val):
+                    try:
+                        out_cell.value = float(s_val)
+                    except ValueError:
+                        out_cell.value = s_val
+                        out_cell.data_type = "s"
+                else:
+                    out_cell.value = s_val
+                    out_cell.data_type = "s"
+                    out_cell.number_format = "@"
+
+        for c_idx, width in col_max_len.items():
+            ws_out.column_dimensions[get_column_letter(c_idx)].width = width
+
+
+def export_batch_pcf_excel(
+    input_file: Union[str, Path],
+    output_file: Union[str, Path],
+    results_df: pd.DataFrame,
+    mode: str = MODE_ONLINE,
+) -> str:
+    """
+    Schreibt das Ergebnis einer Batch-Abfrage als neue .xlsx-Datei:
+    1. 'PCF Results' steht immer als erstes Worksheet an Position 0.
+    2. Alle bestehenden Worksheets der Eingabedatei (.xlsx, binaeres .xls, MHTML-.xls,
+       HTML-.xls oder Excel 2003 XML) bleiben unveraendert bzw. inhaltsgetreu rekonstruiert
+       und in ihrer relativen Originalreihenfolge erhalten.
+    3. Ueberschreibt niemals die Original-Eingabedatei.
+    """
+    in_path = Path(input_file).resolve()
+    out_path = Path(output_file).resolve()
+
+    if out_path.suffix.lower() != ".xlsx":
+        out_path = out_path.with_suffix(".xlsx")
+
+    if out_path == in_path:
+        out_path = in_path.with_name(f"{in_path.stem}_PCF.xlsx")
+
+    detected_fmt = detect_excel_file_format(in_path) if in_path.exists() else "unknown"
+
+    if detected_fmt == "xlsx":
+        wb = openpyxl.load_workbook(str(in_path), data_only=False)
+        if PCF_RESULTS_SHEET_NAME in wb.sheetnames:
+            old_ws = wb[PCF_RESULTS_SHEET_NAME]
+            old_ws.title = f"{PCF_RESULTS_SHEET_NAME} (Input)"
+        for existing_ws in wb.worksheets:
+            if existing_ws.views and existing_ws.views.sheetView:
+                for sv in existing_ws.views.sheetView:
+                    sv.tabSelected = False
+        try:
+            for defn in wb.defined_names.values():
+                if getattr(defn, "localSheetId", None) is not None:
+                    defn.localSheetId = int(defn.localSheetId) + 1
+        except Exception:
+            pass
+        ws_pcf = wb.create_sheet(title=PCF_RESULTS_SHEET_NAME, index=0)
+        wb.active = 0
+        _populate_pcf_results_worksheet(ws_pcf, results_df, mode=mode)
+        wb.save(str(out_path))
+        wb.close()
+    elif detected_fmt == "xls_biff":
+        wb = openpyxl.Workbook()
+        ws_pcf = wb.active
+        ws_pcf.title = PCF_RESULTS_SHEET_NAME
+        _populate_pcf_results_worksheet(ws_pcf, results_df, mode=mode)
+        _copy_xls_sheets_to_openpyxl_workbook(str(in_path), wb)
+        for other_ws in wb.worksheets[1:]:
+            if other_ws.views and other_ws.views.sheetView:
+                for sv in other_ws.views.sheetView:
+                    sv.tabSelected = False
+        wb.active = 0
+        wb.save(str(out_path))
+        wb.close()
+    elif detected_fmt in ("mhtml", "html", "xml_2003"):
+        wb = openpyxl.Workbook()
+        ws_pcf = wb.active
+        ws_pcf.title = PCF_RESULTS_SHEET_NAME
+        _populate_pcf_results_worksheet(ws_pcf, results_df, mode=mode)
+        try:
+            _, sheets_data = _load_all_workbook_sheets_raw(str(in_path))
+            _copy_parsed_text_sheets_to_openpyxl_workbook(sheets_data, wb)
+        except Exception as exc:
+            print(f"[Export Diagnostic] Could not reconstruct text-based input sheets: {exc}")
+        for other_ws in wb.worksheets[1:]:
+            if other_ws.views and other_ws.views.sheetView:
+                for sv in other_ws.views.sheetView:
+                    sv.tabSelected = False
+        wb.active = 0
+        wb.save(str(out_path))
+        wb.close()
+    else:
+        wb = openpyxl.Workbook()
+        ws_pcf = wb.active
+        ws_pcf.title = PCF_RESULTS_SHEET_NAME
+        _populate_pcf_results_worksheet(ws_pcf, results_df, mode=mode)
+        wb.active = 0
+        wb.save(str(out_path))
+        wb.close()
+
+    return str(out_path)
+
+
+def read_pcf_results_table(excel_path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Liest die standardisierte Ergebnistabelle ('Article Number (Short)',
+    'Article Number (Long)', 'PCF', 'PCF Unit') aus dem Worksheet 'PCF Results'
+    einer exportierten .xlsx-Datei ein.
+    """
+    wb = openpyxl.load_workbook(str(excel_path), data_only=True)
+    try:
+        ws = wb[PCF_RESULTS_SHEET_NAME] if PCF_RESULTS_SHEET_NAME in wb.sheetnames else wb.worksheets[0]
+        header_row_idx = None
+        for r_idx in range(1, min(ws.max_row + 1, 25)):
+            c1 = str(ws.cell(r_idx, 1).value or "").strip()
+            if c1 == COL_ARTICLE_SHORT:
+                header_row_idx = r_idx
+                break
+
+        if header_row_idx is None:
+            return pd.DataFrame(columns=[COL_ARTICLE_SHORT, COL_ARTICLE_LONG, COL_PCF, COL_PCF_UNIT])
+
+        headers = [
+            str(ws.cell(header_row_idx, c).value or "").strip()
+            for c in range(1, 5)
+        ]
+        data_rows: List[List[Any]] = []
+        for r_idx in range(header_row_idx + 1, ws.max_row + 1):
+            row_vals = [ws.cell(r_idx, c).value for c in range(1, 5)]
+            if all(v is None or str(v).strip() == "" for v in row_vals):
+                continue
+            data_rows.append([
+                "" if row_vals[0] is None else str(row_vals[0]),
+                "" if row_vals[1] is None else str(row_vals[1]),
+                row_vals[2],
+                "" if row_vals[3] is None else str(row_vals[3]),
+            ])
+        return pd.DataFrame(data_rows, columns=headers)
+    finally:
+        wb.close()
+
+
+# ── Hauptprogramm (Batch Query, ohne GUI) ────────────────────────────────────
 
 def main(
     input_file: str,
@@ -1542,18 +2754,9 @@ def main(
     mode: str = MODE_ONLINE,
 ) -> Optional[Dict[str, Any]]:
     """
-    Verarbeitet eine Excel-Datei mit WAGO-Artikelnummern.
-
-    Parameter:
-        input_file        : Pfad zur Eingabedatei (str)
-        output_file       : Pfad zur Ausgabedatei (str)
-        progress_callback : Optionale Funktion(current, total, article, result_dict)
-        article_column    : Optionale explizite Spaltenauswahl (ueberschreibt Auto-Detection)
-        sheet_name        : Optionaler Worksheet-Name
-        mode              : Betriebsmodus ('online' fuer WAGO AAS API, 'offline' fuer Q4 2026 Snapshot)
-
-    Rueckgabe:
-        dict mit Zusammenfassung oder None bei Fehler
+    Verarbeitet eine Excel-Datei (.xlsx oder .xls) mit WAGO-Artikelnummern und
+    schreibt das Ergebnis in eine neue .xlsx-Datei mit dem ersten Worksheet
+    'PCF Results' sowie allen unveraenderten Original-Worksheets.
     """
     active_mode = MODE_OFFLINE if str(mode).strip().lower() == MODE_OFFLINE else MODE_ONLINE
     print(f"Lese {input_file} (Modus: {MODE_LABELS.get(active_mode, active_mode)}) ...")
@@ -1577,7 +2780,8 @@ def main(
     canonical_all, _, _ = _extract_row_articles(
         df, detection_info, article_column=article_column
     )
-    unique_articles = list(dict.fromkeys(a for a in canonical_all if a))
+    valid_canonical = [a for a in canonical_all if a]
+    unique_articles = list(dict.fromkeys(valid_canonical))
     unique_total    = len(unique_articles)
     total           = len(canonical_all)
 
@@ -1611,19 +2815,22 @@ def main(
             for future in as_completed(futures):
                 article, res = future.result()
                 if res["pcf"] is not None:
-                    pcf_str = f"{res['pcf']} kg CO2e"
+                    u_str = res.get("unit") or DEFAULT_PCF_UNIT
+                    pcf_str = f"{res['pcf']} {u_str}"
                 elif res["status"] == STATUS_QUERY_ERROR:
                     pcf_str = STATUS_QUERY_ERROR
                 else:
                     pcf_str = STATUS_NOT_YET_AVAILABLE
                 print(f"  {article:<25} {pcf_str:<22} [{res['status']}]")
 
-    out_df = prepare_output_dataframe(
+    results_df = prepare_output_dataframe(
         df, detection_info, cache, article_column=article_column
     )
 
     try:
-        out_df.to_excel(output_file, index=False)
+        final_output_path = export_batch_pcf_excel(
+            input_file, output_file, results_df, mode=active_mode
+        )
     except Exception as e:
         print(f"\nFehler beim Schreiben von {output_file}: {e}")
         return None
@@ -1640,9 +2847,7 @@ def main(
         INTERNAL_STATUS_QUERY_ERROR:   0,
     }
 
-    for canonical in canonical_all:
-        if not canonical:
-            continue
+    for canonical in valid_canonical:
         res = cache.get(canonical, {"status": STATUS_QUERY_ERROR, "internal_status": INTERNAL_STATUS_QUERY_ERROR})
         st = res.get("status", STATUS_QUERY_ERROR)
         ist = res.get("internal_status", st)
@@ -1655,57 +2860,481 @@ def main(
 
     summary = {
         "total_rows":        total,
+        "queried_products":  len(valid_canonical),
         "unique_queried":    unique_total,
         "pcf_available":     cust_counts[STATUS_PCF_AVAILABLE],
         "not_yet_available": cust_counts[STATUS_NOT_YET_AVAILABLE],
         "query_errors":      cust_counts[STATUS_QUERY_ERROR],
-        # Interne Diagnosezahlen fuer Troubleshooting beibehalten:
         "aas_no_pcf":        internal_counts[INTERNAL_STATUS_AAS_NO_PCF],
         "not_found":         internal_counts[INTERNAL_STATUS_NOT_FOUND],
         "detected_column":   detected_col,
         "sheet_name":        detection_info.get("sheet_name"),
         "mode":              active_mode,
-        "output_file":       output_file,
+        "output_file":       final_output_path,
     }
 
     print(f"""
 Finished.
 
 Rows total        : {total}
+Queried products  : {len(valid_canonical)}
 Unique queried    : {unique_total}
 PCF available     : {summary['pcf_available']}
 Not yet available : {summary['not_yet_available']}
 Query errors      : {summary['query_errors']}
 
 Output written to:
-{output_file}
+{final_output_path}
 """)
 
     return summary
 
 
-# ── GUI ───────────────────────────────────────────────────────────────────────
+# ── Native Windows Explorer Drag-and-Drop Helper (WM_DROPFILES via ctypes) ──
+
+WM_DROPFILES      = 0x0233
+WM_COPYGLOBALDATA = 0x0049
+MSGFLT_ALLOW      = 1
+GWLP_WNDPROC      = -4
+
+
+def parse_dropped_file_paths(raw_input: Union[str, List[str], Tuple[str, ...], Any]) -> List[str]:
+    """
+    Parst gedroppte Dateipfade aus:
+    - einer Python-Liste/Tupel von Pfaden (aus Win32 DragQueryFileW),
+    - einem einzelnen Pfadstring (auch mit Leerzeichen, Umlauten oder Anfuehrungszeichen),
+    - oder einem Tcl/TkDND-formatierten Event-String (z. B. '{C:/Pfad mit Leerzeichen/a.xlsx} C:/b.xlsx').
+    """
+    if raw_input is None:
+        return []
+
+    if isinstance(raw_input, (list, tuple)):
+        out: List[str] = []
+        for item in raw_input:
+            if item is not None:
+                s = str(item).strip().strip('"')
+                if s:
+                    out.append(s)
+        return out
+
+    s_raw = str(raw_input).strip()
+    if not s_raw:
+        return []
+
+    # Falls der gesamte String bereits als existierender Dateipfad (oder einfacher Pfad ohne '{') vorliegt:
+    clean_single = s_raw.strip('"')
+    if "{" not in s_raw and ("\n" not in s_raw):
+        if os.path.exists(clean_single) or len(s_raw.split()) == 1 or re.match(r"^[A-Za-z]:[\\/]", clean_single):
+            # Pruefe, ob mehrere durch Zeilenumbruch oder Semikolon getrennte Pfade vorliegen
+            if ";" in clean_single and not os.path.exists(clean_single):
+                return [p.strip().strip('"') for p in clean_single.split(";") if p.strip().strip('"')]
+            return [clean_single]
+
+    # Tcl/TkDND-Listenformat: '{Pfad 1 mit Leerzeichen} {Pfad 2} Pfad3'
+    results: List[str] = []
+    i = 0
+    n = len(s_raw)
+    while i < n:
+        while i < n and s_raw[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        if s_raw[i] == "{":
+            end_brace = s_raw.find("}", i + 1)
+            if end_brace == -1:
+                token = s_raw[i + 1 :].strip().strip('"')
+                if token:
+                    results.append(token)
+                break
+            token = s_raw[i + 1 : end_brace].strip().strip('"')
+            if token:
+                results.append(token)
+            i = end_brace + 1
+        elif s_raw[i] == '"':
+            end_quote = s_raw.find('"', i + 1)
+            if end_quote == -1:
+                token = s_raw[i + 1 :].strip()
+                if token:
+                    results.append(token)
+                break
+            token = s_raw[i + 1 : end_quote].strip()
+            if token:
+                results.append(token)
+            i = end_quote + 1
+        else:
+            start = i
+            while i < n and not s_raw[i].isspace():
+                i += 1
+            token = s_raw[start:i].strip().strip('"')
+            if token:
+                results.append(token)
+    return results
+
+
+class _Win32FileDropTarget:
+    """
+    Bindet natives Windows-Explorer Drag-and-Drop (WM_DROPFILES) ohne externe
+    C-Extensions an ein Tkinter-Fenster an.
+
+    WICHTIG fuer GIL- und Thread-Sicherheit in Python/Tkinter:
+    Innerhalb der C-WNDPROC (_py_wndproc) darf NIEMALS direkt in den Tcl/Tk-Interpreter
+    (z. B. via widget.after) aufgerufen werden, da Tcl_DoOneEvent waehrend DispatchMessageW
+    das Python-GIL per PyEval_SaveThread freigibt (andernfalls droht ein Fatal Python Error
+    in PyEval_RestoreThread). Stattdessen legt _py_wndproc die extrahierten Dateipfade
+    ausschliesslich in eine reine Python-Queue (_drop_queue), die vom regulären Tkinter-
+    Event-Loop sicher abgefragt wird.
+    """
+
+    def __init__(self, widget: tk.Misc, on_drop_callback: Callable[[List[str]], Any]):
+        self.widget = widget
+        self.on_drop_callback = on_drop_callback
+        self._drop_queue: "queue.SimpleQueue[List[str]]" = queue.SimpleQueue()
+        self._hooked_hwnds: List[Tuple[int, int, Any]] = []
+        self._after_id: Optional[str] = None
+        self._uninstalled = False
+        self.enabled = False
+
+        if sys.platform == "win32":
+            self._install()
+
+    def _install(self) -> None:
+        try:
+            self.widget.update_idletasks()
+            hwnd = int(self.widget.winfo_id())
+            if not hwnd:
+                return
+
+            shell32 = ctypes.windll.shell32
+            user32  = ctypes.windll.user32
+
+            WNDPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+
+            shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+            shell32.DragAcceptFiles.restype  = None
+
+            shell32.DragQueryFileW.argtypes = [
+                ctypes.c_void_p,
+                wintypes.UINT,
+                wintypes.LPWSTR,
+                wintypes.UINT,
+            ]
+            shell32.DragQueryFileW.restype = wintypes.UINT
+
+            shell32.DragFinish.argtypes = [ctypes.c_void_p]
+            shell32.DragFinish.restype  = None
+
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype  = wintypes.HWND
+
+            set_wnd_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            set_wnd_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            set_wnd_long.restype  = ctypes.c_void_p
+
+            call_wnd_proc = user32.CallWindowProcW
+            call_wnd_proc.argtypes = [
+                ctypes.c_void_p,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            call_wnd_proc.restype = ctypes.c_ssize_t
+
+            change_filter_ex = getattr(user32, "ChangeWindowMessageFilterEx", None)
+            if change_filter_ex is not None:
+                change_filter_ex.argtypes = [
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.DWORD,
+                    ctypes.c_void_p,
+                ]
+                change_filter_ex.restype = wintypes.BOOL
+
+            target_hwnds = [hwnd]
+
+            for target_h in target_hwnds:
+                old_proc_holder = [0]
+
+                def _make_wndproc(holder_ref):
+                    def _py_wndproc(h_wnd, msg, w_param, l_param):
+                        if msg == WM_DROPFILES:
+                            hdrop = w_param
+                            paths: List[str] = []
+                            try:
+                                count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+                                for idx in range(count):
+                                    req_len = shell32.DragQueryFileW(hdrop, idx, None, 0)
+                                    if req_len > 0:
+                                        buf = ctypes.create_unicode_buffer(req_len + 2)
+                                        shell32.DragQueryFileW(hdrop, idx, buf, req_len + 2)
+                                        if buf.value:
+                                            paths.append(buf.value)
+                            except BaseException:
+                                pass
+                            finally:
+                                try:
+                                    shell32.DragFinish(hdrop)
+                                except BaseException:
+                                    pass
+                            if paths:
+                                try:
+                                    self._drop_queue.put(paths)
+                                except BaseException:
+                                    pass
+                            return 0
+                        try:
+                            return call_wnd_proc(holder_ref[0], h_wnd, msg, w_param, l_param)
+                        except BaseException:
+                            return 0
+                    return WNDPROC(_py_wndproc)
+
+                cb = _make_wndproc(old_proc_holder)
+                cb_ptr = ctypes.cast(cb, ctypes.c_void_p).value
+                old_proc = set_wnd_long(target_h, GWLP_WNDPROC, cb_ptr)
+                if old_proc:
+                    old_proc_holder[0] = old_proc
+                    if change_filter_ex is not None:
+                        try:
+                            change_filter_ex(target_h, WM_DROPFILES, MSGFLT_ALLOW, None)
+                            change_filter_ex(target_h, WM_COPYGLOBALDATA, MSGFLT_ALLOW, None)
+                        except Exception:
+                            pass
+                    shell32.DragAcceptFiles(target_h, True)
+                    self._hooked_hwnds.append((target_h, old_proc, cb))
+
+            if self._hooked_hwnds:
+                self.enabled = True
+                self._after_id = self.widget.after(50, self._poll_drop_queue)
+        except Exception:
+            self.enabled = False
+
+    def _poll_drop_queue(self) -> None:
+        self._after_id = None
+        if self._uninstalled:
+            return
+        latest_batch: Optional[List[str]] = None
+        while not self._drop_queue.empty():
+            try:
+                latest_batch = self._drop_queue.get_nowait()
+            except Exception:
+                break
+        if latest_batch:
+            try:
+                self.on_drop_callback(latest_batch)
+            except Exception as e:
+                print(f"Drag-and-drop callback error: {e}")
+        if not self._uninstalled:
+            try:
+                self._after_id = self.widget.after(50, self._poll_drop_queue)
+            except Exception:
+                pass
+
+    def uninstall(self) -> None:
+        self._uninstalled = True
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        if self.enabled and self._hooked_hwnds and sys.platform == "win32":
+            try:
+                user32  = ctypes.windll.user32
+                shell32 = ctypes.windll.shell32
+                set_wnd_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+                set_wnd_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+                set_wnd_long.restype  = ctypes.c_void_p
+                shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+                shell32.DragAcceptFiles.restype  = None
+                for target_h, old_proc, _cb in reversed(self._hooked_hwnds):
+                    try:
+                        shell32.DragAcceptFiles(target_h, False)
+                        set_wnd_long(target_h, GWLP_WNDPROC, old_proc)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self._hooked_hwnds.clear()
+        self.enabled = False
+
+
+# ── Application Icon, Windows Taskbar Identity & Responsive Geometry ─────────
+
+APP_USER_MODEL_ID = "WAGO.Sustainability.AASPCFQuery.3.0"
+ICON_FILENAME     = "wago_pcf_icon.ico"
+DEFAULT_WIN_WIDTH  = 720
+DEFAULT_WIN_HEIGHT = 820
+MIN_WIN_WIDTH      = 620
+MIN_WIN_HEIGHT     = 560
+
+
+def get_resource_path(relative_path: str) -> str:
+    """Loest Ressourcenpfade sowohl in der Entwicklungsumgebung als auch in PyInstaller (_MEIPASS) auf."""
+    if hasattr(sys, "_MEIPASS"):
+        candidate = os.path.join(getattr(sys, "_MEIPASS"), relative_path)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(os.path.abspath(os.path.dirname(__file__)), relative_path)
+
+
+def _set_windows_app_user_model_id() -> None:
+    """Setzt die explizite Windows AppUserModelID, damit die Taskleiste das App-Icon korrekt anzeigt."""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        except Exception:
+            pass
+
+
+def _generate_fallback_ico_bytes() -> bytes:
+    """
+    Erzeugt zur Laufzeit ein Multi-Resolution-ICO im WAGO Corporate Design als Fallback,
+    falls wago_pcf_icon.ico in einer isolierten Testumgebung nicht auf der Festplatte liegt.
+    """
+    import struct
+    from PIL import Image, ImageDraw
+
+    sizes = [16, 24, 32, 48, 64, 128, 256]
+    payloads: List[Tuple[int, bytes]] = []
+    for sz in sizes:
+        im = Image.new("RGBA", (sz, sz), (0x1F, 0x28, 0x37, 255))
+        dr = ImageDraw.Draw(im)
+        pad = max(1, sz // 8)
+        dr.rectangle([pad, pad, sz - 1 - pad, sz - 1 - pad], outline=(0x6E, 0xC8, 0x00, 255), width=max(1, sz // 12))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        payloads.append((sz, buf.getvalue()))
+
+    header = struct.pack("<HHH", 0, 1, len(payloads))
+    offset = 6 + 16 * len(payloads)
+    entries: List[bytes] = []
+    for sz, data in payloads:
+        wb_sz = 0 if sz == 256 else sz
+        entries.append(struct.pack("<BBBBHHII", wb_sz, wb_sz, 0, 0, 1, 32, len(data), offset))
+        offset += len(data)
+    return header + b"".join(entries) + b"".join(d for _, d in payloads)
+
+
+def _ensure_application_icon_path() -> Optional[str]:
+    """
+    Gibt den Pfad zur eingebetteten wago_pcf_icon.ico zurueck (oder erzeugt eine
+    temporaere Fallback-Datei, sodass zur Laufzeit niemals eine externe Datei erforderlich ist).
+    """
+    primary = get_resource_path(ICON_FILENAME)
+    if os.path.isfile(primary):
+        return primary
+    try:
+        import tempfile
+        fallback_path = os.path.join(tempfile.gettempdir(), "wago_pcf_icon_runtime.ico")
+        if not os.path.isfile(fallback_path):
+            Path(fallback_path).write_bytes(_generate_fallback_ico_bytes())
+        return fallback_path
+    except Exception:
+        return None
+
+
+def get_available_desktop_work_area(widget: Optional[tk.Misc] = None) -> Tuple[int, int, int, int]:
+    """
+    Ermittelt den verfuegbaren Desktop-Arbeitsbereich (ohne Windows-Taskleiste) als
+    (work_x, work_y, work_width, work_height).
+    """
+    if sys.platform == "win32":
+        try:
+            SPI_GETWORKAREA = 0x0030
+            rect = wintypes.RECT()
+            ok = ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, ctypes.byref(rect), 0
+            )
+            if ok:
+                w = int(rect.right - rect.left)
+                h = int(rect.bottom - rect.top)
+                if w >= 400 and h >= 300:
+                    return int(rect.left), int(rect.top), w, h
+        except Exception:
+            pass
+
+    if widget is not None:
+        try:
+            sw = int(widget.winfo_screenwidth())
+            sh = int(widget.winfo_screenheight())
+            return 0, 0, max(640, sw), max(480, sh - 48)
+        except Exception:
+            pass
+    return 0, 0, 1920, 1032
+
+
+def compute_responsive_window_geometry(
+    req_w: int,
+    req_h: int,
+    work_w: int,
+    work_h: int,
+    work_x: int = 0,
+    work_y: int = 0,
+) -> Tuple[int, int, int, int, int, int]:
+    """
+    Berechnet (width, height, pos_x, pos_y, min_width, min_height) unter
+    Beruecksichtigung der tatsaechlichen Inhaltsgroesse, der Bildschirmaufloesung
+    (z. B. 1366x768, 1920x1080, 2560x1440, 3840x2160) und der Windows-DPI-Skalierung
+    (100%, 125%, 150%, 200%), sodass das Fenster niemals ueber den verfuegbaren
+    Desktop-Arbeitsbereich hinausragt und zentriert geoeffnet wird.
+    """
+    margin_w = 24 if work_w >= 800 else 8
+    margin_h = 28 if work_h >= 700 else 12
+
+    max_avail_w = max(480, work_w - margin_w)
+    max_avail_h = max(420, work_h - margin_h)
+
+    min_w = min(MIN_WIN_WIDTH, max_avail_w)
+    min_h = min(MIN_WIN_HEIGHT, max_avail_h)
+
+    desired_w = max(req_w, DEFAULT_WIN_WIDTH, min_w)
+    desired_h = max(req_h, DEFAULT_WIN_HEIGHT, min_h)
+
+    final_w = min(desired_w, max_avail_w)
+    final_h = min(desired_h, max_avail_h)
+
+    pos_x = work_x + max(0, (work_w - final_w) // 2)
+    pos_y = work_y + max(0, (work_h - final_h) // 2)
+
+    return final_w, final_h, pos_x, pos_y, min_w, min_h
+
+
+# ── GUI (WAGO Corporate Design, 3 Workflows) ─────────────────────────────────
 
 class PCFQueryApp(tk.Tk):
     """
-    Vollstaendige Tkinter-GUI fuer das WAGO AAS PCF Query Tool.
-    Verwendet ThreadPoolExecutor fuer parallele AAS-Abfragen.
+    WAGO AAS PCF Query Tool GUI im offiziellen WAGO Corporate Design.
+    Unterstuetzt drei Workflows:
+    1. Single Query
+    2. Batch Query (inkl. .xlsx/.xls & Drag-and-Drop)
+    3. PCF Portfolio Coverage (inkl. Hintergrund-Excel-Export & Fortschrittsanzeige)
     """
 
-    C_BG           = "#1e2228"
-    C_PANEL        = "#262c35"
-    C_BORDER       = "#353d47"
-    C_ACCENT       = "#8cc63f"
-    C_ACCENT_HOVER = "#9dd94f"
-    C_SUCCESS      = "#4caf73"
-    C_WARN         = "#f0a500"
-    C_ERROR        = "#e05252"
-    C_INFO         = "#4da3ff"
-    C_INFO_BG      = "#1f2a38"
-    C_INFO_BORDER  = "#2e4c73"
-    C_TEXT         = "#e8eaed"
-    C_MUTED        = "#8a9bb0"
-    C_BTN_FG       = "#ffffff"
+    # Official WAGO Corporate Design Colors (Section 8.2)
+    C_BG            = WAGO_LIGHT_GREY     # #EFF0F1
+    C_PANEL         = WAGO_WHITE          # #FFFFFF
+    C_HEADER_BG     = WAGO_ANTHRACITE     # #1F2837
+    C_BORDER        = WAGO_ANTHRACITE_15  # #DEDFE1
+    C_BORDER_STRONG = WAGO_ANTHRACITE_40  # #A5A8AF
+    C_ACCENT        = WAGO_GREEN          # #6EC800
+    C_ACCENT_HOVER  = WAGO_GREEN_HOVER    # #5EB000
+    C_TEXT          = WAGO_ANTHRACITE     # #1F2837
+    C_MUTED         = WAGO_ANTHRACITE_70  # #616A73
+    C_BTN_FG        = WAGO_ANTHRACITE     # #1F2837 (High contrast on WAGO Green & light buttons)
+    C_SUCCESS       = "#2E8540"
+    C_WARN          = "#B45309"
+    C_ERROR         = "#C81E1E"
+    C_INFO          = "#1D4ED8"
+    C_INFO_BG       = "#EBF3FE"
+    C_INFO_BORDER   = "#93C5FD"
+    C_DROP_BG       = "#F7FAF2"
+    C_DROP_ACTIVE   = "#E6F4D2"
 
     FONT_HEAD  = ("Segoe UI", 13, "bold")
     FONT_LABEL = ("Segoe UI", 9)
@@ -1714,74 +3343,288 @@ class PCFQueryApp(tk.Tk):
     FONT_SMALL = ("Segoe UI", 8)
 
     def __init__(self):
+        import gc
+        gc.collect()
+        _set_windows_app_user_model_id()
         super().__init__()
         self.title("WAGO AAS PCF Query")
         self.configure(bg=self.C_BG)
-        self.resizable(False, False)
+        self.resizable(True, True)
 
-        self._input_path: Optional[str]              = None
-        self._output_path: Optional[str]             = None
-        self._df: Optional[pd.DataFrame]             = None
-        self._detection_info: Dict[str, Any]         = {}
-        self._selected_sheet: Optional[str]          = None
-        self._selected_column: Optional[str]         = None
-        self._canonical_articles: List[str]          = []
+        self._icon_path: Optional[str]                = None
+        self._app_icon_photos: List[Any]              = []
+        self._win32_hicons: List[int]                 = []
+
+        self._active_workflow: str                    = WORKFLOW_BATCH
+        self._mode_var                                = tk.StringVar(value=MODE_ONLINE)
+        self._offline_notice_visible: bool            = False
+        self._vscroll_visible: bool                   = False
+
+        # Batch Query State
+        self._input_path: Optional[str]               = None
+        self._output_path: Optional[str]              = None
+        self._df: Optional[pd.DataFrame]              = None
+        self._detection_info: Dict[str, Any]          = {}
+        self._selected_sheet: Optional[str]           = None
+        self._selected_column: Optional[str]          = None
+        self._canonical_articles: List[str]           = []
         self._query_thread: Optional[threading.Thread] = None
-        self._stop_event                             = threading.Event()
-        self._mode_var                               = tk.StringVar(value=MODE_ONLINE)
-        self._offline_notice_visible: bool           = False
+        self._stop_event                              = threading.Event()
 
+        # Single Query State
+        self._single_article_var                      = tk.StringVar(value="")
+        self._single_last_result: Optional[Dict[str, Any]] = None
+        self._single_thread: Optional[threading.Thread] = None
+
+        # Portfolio Coverage & Background Export State
+        self._portfolio_thread: Optional[threading.Thread] = None
+        self._portfolio_stop_event                    = threading.Event()
+        self._portfolio_result: Optional[Dict[str, Any]] = None
+        self._portfolio_output_path: Optional[str]    = None
+        self._portfolio_export_thread: Optional[threading.Thread] = None
+        self._portfolio_export_stop_event             = threading.Event()
+        self._portfolio_export_running: bool          = False
+        self._portfolio_export_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+
+        self._drop_target: Optional[_Win32FileDropTarget] = None
+
+        self._apply_window_and_taskbar_icon()
         self._build_ui()
         self._center_window()
+        self._apply_win32_taskbar_icons()
+        self._drop_target = _Win32FileDropTarget(self, self.handle_dropped_files)
 
-    # ── UI-Aufbau ─────────────────────────────────────────────────────────────
+    def destroy(self):
+        if self._drop_target is not None:
+            self._drop_target.uninstall()
+            self._drop_target = None
+        if sys.platform == "win32" and self._win32_hicons:
+            user32 = ctypes.windll.user32
+            user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+            user32.DestroyIcon.restype  = wintypes.BOOL
+            for hicon in self._win32_hicons:
+                try:
+                    user32.DestroyIcon(hicon)
+                except Exception:
+                    pass
+            self._win32_hicons.clear()
+        # Clear ImageTk.PhotoImage references while this Tcl interpreter is still alive
+        # so PhotoImage.__del__ never fires during garbage collection on a later Tcl interpreter.
+        try:
+            self.iconphoto(False)
+        except Exception:
+            pass
+        self._app_icon_photos.clear()
+        self._logo_img = None
+        super().destroy()
+
+    # ── Icon-Konfiguration (Window, Taskbar, Alt+Tab, Explorer) ───────────────
+
+    def _apply_window_and_taskbar_icon(self) -> None:
+        icon_path = _ensure_application_icon_path()
+        self._icon_path = icon_path
+        if not icon_path or not os.path.isfile(icon_path):
+            return
+
+        try:
+            self.iconbitmap(default=icon_path)
+            self.iconbitmap(icon_path)
+        except Exception:
+            pass
+
+        try:
+            from PIL import Image, ImageTk
+            with Image.open(icon_path) as ico_img:
+                photos = []
+                for sz in (48, 32, 24, 16):
+                    try:
+                        ico_img.size = (sz, sz)
+                        frame = ico_img.copy().convert("RGBA")
+                    except Exception:
+                        frame = ico_img.resize((sz, sz), Image.Resampling.LANCZOS).convert("RGBA")
+                    photos.append(ImageTk.PhotoImage(frame))
+                if photos:
+                    self._app_icon_photos = photos
+                    self.iconphoto(True, *photos)
+        except Exception:
+            pass
+
+    def _apply_win32_taskbar_icons(self) -> None:
+        """Setzt ICON_SMALL (16x16) und ICON_BIG (32x32) explizit via Win32 WM_SETICON."""
+        if sys.platform != "win32" or not self._icon_path or not os.path.isfile(self._icon_path):
+            return
+        try:
+            self.update_idletasks()
+            user32 = ctypes.windll.user32
+            WM_SETICON = 0x0080
+            ICON_SMALL = 0
+            ICON_BIG   = 1
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+
+            user32.LoadImageW.argtypes = [
+                wintypes.HINSTANCE,
+                wintypes.LPCWSTR,
+                wintypes.UINT,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.LoadImageW.restype = ctypes.c_void_p
+
+            user32.SendMessageW.argtypes = [
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            ]
+            user32.SendMessageW.restype = ctypes.c_ssize_t
+
+            user32.GetParent.argtypes = [wintypes.HWND]
+            user32.GetParent.restype  = wintypes.HWND
+
+            h_small = user32.LoadImageW(None, self._icon_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+            h_big   = user32.LoadImageW(None, self._icon_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+
+            hwnd = self.winfo_id()
+            parent_hwnd = user32.GetParent(hwnd)
+            for target_hwnd in (hwnd, parent_hwnd):
+                if target_hwnd:
+                    if h_small:
+                        user32.SendMessageW(target_hwnd, WM_SETICON, ICON_SMALL, h_small)
+                    if h_big:
+                        user32.SendMessageW(target_hwnd, WM_SETICON, ICON_BIG, h_big)
+
+            if h_small:
+                self._win32_hicons.append(h_small)
+            if h_big:
+                self._win32_hicons.append(h_big)
+        except Exception:
+            pass
+
+    # ── UI-Aufbau (Responsiv + Scrollbar bei kleinen Bildschirmen) ────────────
 
     def _build_ui(self):
-        tk.Frame(self, bg=self.C_ACCENT, height=4).pack(fill="x")
+        # 1. Fixed Top Header & Navigation
+        tk.Frame(self, bg=self.C_ACCENT, height=5).pack(side="top", fill="x")
 
-        title_frame = tk.Frame(self, bg=self.C_BG)
-        title_frame.pack(fill="x", padx=16, pady=(12, 4))
+        header_frame = tk.Frame(self, bg=self.C_HEADER_BG)
+        header_frame.pack(side="top", fill="x")
 
-        text_frame = tk.Frame(title_frame, bg=self.C_BG)
+        title_inner = tk.Frame(header_frame, bg=self.C_HEADER_BG)
+        title_inner.pack(fill="x", padx=18, pady=10)
+
+        text_frame = tk.Frame(title_inner, bg=self.C_HEADER_BG)
         text_frame.pack(side="left")
 
         tk.Label(
             text_frame, text="WAGO AAS PCF Query",
-            font=("Segoe UI", 16, "bold"),
-            fg=self.C_ACCENT, bg=self.C_BG,
+            font=("Segoe UI", 15, "bold"),
+            fg=WAGO_WHITE, bg=self.C_HEADER_BG,
         ).pack(anchor="w")
         tk.Label(
-            text_frame, text="Product Carbon Footprint – AAS Portal Query Tool",
-            font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_BG,
+            text_frame, text="Product Carbon Footprint – AAS Portal & Portfolio Tool",
+            font=self.FONT_SMALL, fg=WAGO_ANTHRACITE_15, bg=self.C_HEADER_BG,
         ).pack(anchor="w")
-
-        def get_resource_path(relative_path: str) -> str:
-            if hasattr(sys, "_MEIPASS"):
-                return os.path.join(sys._MEIPASS, relative_path)
-            return os.path.join(os.path.abspath(os.path.dirname(__file__)), relative_path)
 
         try:
             from PIL import Image, ImageTk
             logo_path = get_resource_path("WAGO_LOGO.webp")
             if os.path.exists(logo_path):
                 img = Image.open(logo_path)
-                h_new = 36
+                h_new = 34
                 w_new = int(img.width * (h_new / img.height))
                 img = img.resize((w_new, h_new), Image.Resampling.LANCZOS)
                 self._logo_img = ImageTk.PhotoImage(img)
-                tk.Label(title_frame, image=self._logo_img, bg=self.C_BG).pack(side="right", anchor="e")
+                tk.Label(title_inner, image=self._logo_img, bg=self.C_HEADER_BG).pack(side="right", anchor="e")
         except Exception as e:
             print(f"Logo not loaded: {e}")
 
-        self._divider()
+        # Workflow Navigation Bar (3 Tabs)
+        nav_bar = tk.Frame(self, bg=WAGO_ANTHRACITE_15, height=36)
+        nav_bar.pack(side="top", fill="x")
 
-        # ── Modus-Auswahl (Online / Offline) ──────────────────────────────────
-        self._section("Data Source Mode")
-        self._frm_mode_container = tk.Frame(self, bg=self.C_BG)
-        self._frm_mode_container.pack(fill="x", padx=16, pady=(2, 4))
+        self._tab_buttons: Dict[str, tk.Button] = {}
+        tab_defs = [
+            (WORKFLOW_SINGLE,    "  Single Query  "),
+            (WORKFLOW_BATCH,     "  Batch Query (Excel)  "),
+            (WORKFLOW_PORTFOLIO, "  Portfolio Coverage  "),
+        ]
+        for wf_key, wf_label in tab_defs:
+            btn = tk.Button(
+                nav_bar,
+                text=wf_label,
+                command=lambda k=wf_key: self.select_workflow(k),
+                font=self.FONT_BOLD,
+                relief="flat",
+                bd=0,
+                padx=14,
+                pady=7,
+                cursor="hand2",
+            )
+            btn.pack(side="left", padx=(2, 0), pady=(2, 0))
+            self._tab_buttons[wf_key] = btn
 
-        frm_radios = tk.Frame(self._frm_mode_container, bg=self.C_BG)
-        frm_radios.pack(fill="x")
+        # 2. Fixed Bottom Footer (Docked at side='bottom' BEFORE scrollable body so it is never cut off)
+        self._frm_footer_container = tk.Frame(self, bg=self.C_BG)
+        self._frm_footer_container.pack(side="bottom", fill="x")
+
+        tk.Frame(self._frm_footer_container, bg=self.C_BORDER, height=1).pack(fill="x", padx=8, pady=(2, 4))
+        frm_footer = tk.Frame(self._frm_footer_container, bg=self.C_BG)
+        frm_footer.pack(fill="x", padx=16, pady=(0, 6))
+
+        tk.Label(
+            frm_footer, text="Developed by Alexander Flekler · WAGO Corporate Sustainability",
+            font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_BG,
+        ).pack(side="left")
+
+        btn_about = tk.Button(
+            frm_footer, text="About", command=self._on_about,
+            font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_BG,
+            relief="flat", cursor="hand2", bd=0,
+            activebackground=self.C_BG, activeforeground=self.C_TEXT,
+        )
+        btn_about.pack(side="right")
+
+        # 3. Scrollable Main Body Area (Canvas + Vertical Scrollbar)
+        self._frm_body = tk.Frame(self, bg=self.C_BG)
+        self._frm_body.pack(side="top", fill="both", expand=True)
+
+        self._body_canvas = tk.Canvas(
+            self._frm_body, bg=self.C_BG, highlightthickness=0, bd=0
+        )
+        self._vscroll = ttk.Scrollbar(
+            self._frm_body, orient="vertical", command=self._body_canvas.yview
+        )
+        self._body_canvas.configure(yscrollcommand=self._vscroll.set)
+        self._body_canvas.pack(side="left", fill="both", expand=True)
+
+        self._scroll_content = tk.Frame(self._body_canvas, bg=self.C_BG)
+        self._canvas_win_id = self._body_canvas.create_window(
+            (0, 0), window=self._scroll_content, anchor="nw"
+        )
+
+        self._scroll_content.bind("<Configure>", self._on_scroll_content_configure)
+        self._body_canvas.bind("<Configure>", self._on_body_canvas_configure)
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+
+        # ── Shared Data Source Mode Selector & Q4 2026 Notice ────────────────
+        self._frm_mode_section = tk.Frame(self._scroll_content, bg=self.C_BG)
+        self._frm_mode_section.pack(fill="x", padx=16, pady=(6, 2))
+
+        tk.Label(
+            self._frm_mode_section, text="DATA SOURCE MODE",
+            font=("Segoe UI", 8, "bold"), fg=self.C_MUTED, bg=self.C_BG,
+        ).pack(anchor="w")
+
+        self._frm_mode_container = tk.Frame(
+            self._frm_mode_section, bg=self.C_PANEL,
+            highlightbackground=self.C_BORDER, highlightthickness=1,
+        )
+        self._frm_mode_container.pack(fill="x", pady=(2, 2))
+
+        frm_radios = tk.Frame(self._frm_mode_container, bg=self.C_PANEL)
+        frm_radios.pack(fill="x", padx=10, pady=5)
 
         self._rb_online = tk.Radiobutton(
             frm_radios,
@@ -1791,13 +3634,13 @@ class PCFQueryApp(tk.Tk):
             command=self._on_mode_changed,
             font=self.FONT_BOLD,
             fg=self.C_TEXT,
-            bg=self.C_BG,
+            bg=self.C_PANEL,
             selectcolor=self.C_PANEL,
-            activebackground=self.C_BG,
-            activeforeground=self.C_ACCENT,
+            activebackground=self.C_PANEL,
+            activeforeground=self.C_TEXT,
             cursor="hand2",
         )
-        self._rb_online.pack(side="left", padx=(0, 16))
+        self._rb_online.pack(side="left", padx=(0, 18))
 
         self._rb_offline = tk.Radiobutton(
             frm_radios,
@@ -1807,17 +3650,25 @@ class PCFQueryApp(tk.Tk):
             command=self._on_mode_changed,
             font=self.FONT_BOLD,
             fg=self.C_TEXT,
-            bg=self.C_BG,
+            bg=self.C_PANEL,
             selectcolor=self.C_PANEL,
-            activebackground=self.C_BG,
-            activeforeground=self.C_ACCENT,
+            activebackground=self.C_PANEL,
+            activeforeground=self.C_TEXT,
             cursor="hand2",
         )
         self._rb_offline.pack(side="left")
 
+        self._lbl_portfolio_mode_hint = tk.Label(
+            frm_radios,
+            text="Live WAGO AAS API required for Portfolio Coverage (Q4 2026 used for comparison only)",
+            font=self.FONT_SMALL,
+            fg=self.C_MUTED,
+            bg=self.C_PANEL,
+        )
+
         # Informations-Banner fuer den Offline-Modus (standardmaessig ausgeblendet)
         self._frm_offline_notice = tk.Frame(
-            self._frm_mode_container,
+            self._frm_mode_section,
             bg=self.C_INFO_BG,
             highlightbackground=self.C_INFO_BORDER,
             highlightthickness=1,
@@ -1831,7 +3682,7 @@ class PCFQueryApp(tk.Tk):
             anchor="w",
             justify="left",
         )
-        self._lbl_offline_title.pack(fill="x", padx=10, pady=(6, 2))
+        self._lbl_offline_title.pack(fill="x", padx=10, pady=(5, 1))
 
         self._lbl_offline_text = tk.Label(
             self._frm_offline_notice,
@@ -1839,11 +3690,11 @@ class PCFQueryApp(tk.Tk):
             font=self.FONT_SMALL,
             fg=self.C_TEXT,
             bg=self.C_INFO_BG,
-            wraplength=440,
+            wraplength=640,
             anchor="w",
             justify="left",
         )
-        self._lbl_offline_text.pack(fill="x", padx=10, pady=(0, 2))
+        self._lbl_offline_text.pack(fill="x", padx=10, pady=(0, 1))
 
         self._lbl_offline_link = tk.Label(
             self._frm_offline_notice,
@@ -1854,29 +3705,222 @@ class PCFQueryApp(tk.Tk):
             cursor="hand2",
             anchor="w",
         )
-        self._lbl_offline_link.pack(anchor="w", padx=10, pady=(0, 6))
+        self._lbl_offline_link.pack(anchor="w", padx=10, pady=(0, 5))
         self._lbl_offline_link.bind("<Button-1>", lambda _e: webbrowser.open(OFFLINE_PORTAL_URL))
 
-        self._divider()
+        # ── Main Content Container for the 3 Workflow Frames ─────────────────
+        self._frm_content = tk.Frame(self._scroll_content, bg=self.C_BG)
+        self._frm_content.pack(fill="both", expand=True)
 
-        # ── Dateiauswahl ──────────────────────────────────────────────────────
-        self._section("Excel File")
-        btn_row = tk.Frame(self, bg=self.C_BG)
+        self._workflow_frames: Dict[str, tk.Frame] = {
+            WORKFLOW_SINGLE:    tk.Frame(self._frm_content, bg=self.C_BG),
+            WORKFLOW_BATCH:     tk.Frame(self._frm_content, bg=self.C_BG),
+            WORKFLOW_PORTFOLIO: tk.Frame(self._frm_content, bg=self.C_BG),
+        }
+
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure(
+            "WAGO.Horizontal.TProgressbar",
+            troughcolor=self.C_BORDER,
+            background=self.C_ACCENT,
+            bordercolor=self.C_PANEL,
+            lightcolor=self.C_ACCENT,
+            darkcolor=self.C_ACCENT,
+        )
+
+        self._wrap_labels: List[tk.Label] = [self._lbl_offline_text]
+
+        self._build_single_query_tab(self._workflow_frames[WORKFLOW_SINGLE])
+        self._build_batch_query_tab(self._workflow_frames[WORKFLOW_BATCH])
+        self._build_portfolio_coverage_tab(self._workflow_frames[WORKFLOW_PORTFOLIO])
+
+        self.select_workflow(WORKFLOW_BATCH)
+
+    def _on_scroll_content_configure(self, _event=None):
+        try:
+            self._body_canvas.configure(scrollregion=self._body_canvas.bbox("all"))
+            self._update_scrollbar_visibility()
+        except Exception:
+            pass
+
+    def _on_body_canvas_configure(self, event=None):
+        try:
+            canvas_w = event.width if (event and event.width > 100) else self._body_canvas.winfo_width()
+            if canvas_w > 100:
+                self._body_canvas.itemconfigure(self._canvas_win_id, width=canvas_w)
+                wrap_px = max(320, canvas_w - 56)
+                for lbl in self._wrap_labels:
+                    try:
+                        lbl.configure(wraplength=wrap_px)
+                    except Exception:
+                        pass
+            self._update_scrollbar_visibility()
+        except Exception:
+            pass
+
+    def _update_scrollbar_visibility(self):
+        try:
+            req_h = self._scroll_content.winfo_reqheight()
+            can_h = self._body_canvas.winfo_height()
+            need_scroll = can_h > 50 and req_h > (can_h + 4)
+            if need_scroll and not self._vscroll_visible:
+                self._vscroll.pack(side="right", fill="y")
+                self._vscroll_visible = True
+            elif not need_scroll and self._vscroll_visible:
+                self._vscroll.pack_forget()
+                self._vscroll_visible = False
+                self._body_canvas.yview_moveto(0.0)
+        except Exception:
+            pass
+
+    def _on_mousewheel(self, event):
+        try:
+            if self._vscroll_visible and self._body_canvas.winfo_exists():
+                delta = int(-1 * (event.delta / 120))
+                if delta != 0:
+                    self._body_canvas.yview_scroll(delta, "units")
+        except Exception:
+            pass
+
+    # ── Tab 1: Single Query UI ────────────────────────────────────────────────
+
+    def _build_single_query_tab(self, parent: tk.Frame):
+        self._section_in(parent, "Single Product PCF Lookup")
+        frm_in = self._make_panel_in(parent)
+        frm_in.pack(fill="x", padx=16, pady=(2, 6))
+
+        lbl_prompt = tk.Label(
+            frm_in,
+            text="Enter a WAGO article number (Short or Long format, e.g. 221-412 or 0221-0412):",
+            font=self.FONT_LABEL, fg=self.C_TEXT, bg=self.C_PANEL,
+            anchor="w", justify="left", wraplength=640,
+        )
+        lbl_prompt.pack(fill="x", padx=12, pady=(10, 4))
+        self._wrap_labels.append(lbl_prompt)
+
+        entry_row = tk.Frame(frm_in, bg=self.C_PANEL)
+        entry_row.pack(fill="x", padx=12, pady=(0, 8))
+
+        self._entry_single = tk.Entry(
+            entry_row,
+            textvariable=self._single_article_var,
+            font=("Consolas", 11),
+            fg=self.C_TEXT,
+            bg=WAGO_LIGHT_GREY,
+            relief="solid",
+            bd=1,
+            width=28,
+        )
+        self._entry_single.pack(side="left", padx=(0, 10), ipady=4)
+        self._entry_single.bind("<Return>", lambda _e: self._on_single_query())
+
+        self._btn_single_query = self._make_button(
+            entry_row, "  Query PCF  ", self._on_single_query, accent=True
+        )
+        self._btn_single_query.pack(side="left")
+
+        self._lbl_single_status = tk.Label(
+            frm_in, text="Ready.", font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_PANEL,
+            anchor="w", justify="left", wraplength=640,
+        )
+        self._lbl_single_status.pack(fill="x", padx=12, pady=(0, 8))
+        self._wrap_labels.append(self._lbl_single_status)
+
+        # Result Card
+        self._section_in(parent, "Query Result")
+        frm_res = self._make_panel_in(parent)
+        frm_res.pack(fill="x", padx=16, pady=(2, 6))
+
+        self._single_fields: Dict[str, tk.Label] = {}
+        field_defs = [
+            ("article_short", "Article Number (Short):"),
+            ("article_long",  "Article Number (Long):"),
+            ("pcf_display",   "PCF:"),
+            ("unit",          "PCF Unit:"),
+            ("data_source",   "Data Source:"),
+        ]
+        for f_key, f_lbl in field_defs:
+            row = tk.Frame(frm_res, bg=self.C_PANEL)
+            row.pack(fill="x", padx=12, pady=4)
+            tk.Label(
+                row, text=f_lbl, font=self.FONT_BOLD,
+                fg=self.C_MUTED, bg=self.C_PANEL, width=24, anchor="w",
+            ).pack(side="left")
+            v_lbl = tk.Label(
+                row, text="—", font=self.FONT_MONO,
+                fg=self.C_TEXT, bg=self.C_PANEL, anchor="w", justify="left",
+            )
+            v_lbl.pack(side="left", fill="x", expand=True)
+            self._single_fields[f_key] = v_lbl
+
+        # Copy Buttons
+        frm_copy = tk.Frame(parent, bg=self.C_BG)
+        frm_copy.pack(fill="x", padx=16, pady=(4, 8))
+
+        self._btn_copy_val = self._make_button(
+            frm_copy, "  Copy PCF Value  ", lambda: self._copy_single_result(value_only=True)
+        )
+        self._btn_copy_val.pack(side="left", padx=(0, 8))
+        self._btn_copy_val.config(state="disabled")
+
+        self._btn_copy_all = self._make_button(
+            frm_copy, "  Copy Complete Result  ", lambda: self._copy_single_result(value_only=False)
+        )
+        self._btn_copy_all.pack(side="left")
+        self._btn_copy_all.config(state="disabled")
+
+    # ── Tab 2: Batch Query UI ─────────────────────────────────────────────────
+
+    def _build_batch_query_tab(self, parent: tk.Frame):
+        self._section_in(parent, "Excel File (.xlsx / .xls) — Drag & Drop or Browse")
+
+        # Drag-and-Drop Zone
+        self._frm_drop_zone = tk.Frame(
+            parent,
+            bg=self.C_DROP_BG,
+            highlightbackground=self.C_ACCENT,
+            highlightthickness=2,
+            cursor="hand2",
+        )
+        self._frm_drop_zone.pack(fill="x", padx=16, pady=(2, 4))
+
+        self._lbl_drop_hint = tk.Label(
+            self._frm_drop_zone,
+            text="Drag & Drop Excel file (.xlsx, .xls) here or click 'Select Excel File'",
+            font=self.FONT_BOLD,
+            fg=self.C_TEXT,
+            bg=self.C_DROP_BG,
+            pady=7,
+            wraplength=640,
+        )
+        self._lbl_drop_hint.pack(fill="x", padx=10)
+        self._lbl_drop_hint.bind("<Button-1>", lambda _e: self._on_select_file())
+        self._wrap_labels.append(self._lbl_drop_hint)
+
+        btn_row = tk.Frame(parent, bg=self.C_BG)
         btn_row.pack(fill="x", padx=16, pady=(2, 4))
+
         self._btn_select = self._make_button(
             btn_row, "  Select Excel File", self._on_select_file
         )
-        self._btn_select.pack(side="left")
+        self._btn_select.pack(side="left", padx=(0, 8))
+
+        self._btn_clear_file = self._make_button(
+            btn_row, "  Remove File", self.clear_selected_file
+        )
+        self._btn_clear_file.pack(side="left")
+        self._btn_clear_file.config(state="disabled")
 
         self._lbl_path = tk.Label(
-            self, text="No file selected.",
+            parent, text="No file selected.",
             font=self.FONT_MONO, fg=self.C_MUTED, bg=self.C_BG,
-            wraplength=460, justify="left",
+            wraplength=640, justify="left", anchor="w",
         )
-        self._lbl_path.pack(anchor="w", padx=16, pady=(0, 4))
+        self._lbl_path.pack(fill="x", padx=16, pady=(0, 3))
+        self._wrap_labels.append(self._lbl_path)
 
-        # Optionale Spalten-/Sheet-Auswahl (automatisch vorbelegt, manuell anpassbar)
-        self._frm_selectors = tk.Frame(self, bg=self.C_BG)
+        self._frm_selectors = tk.Frame(parent, bg=self.C_BG)
         self._frm_selectors.pack(fill="x", padx=16, pady=(0, 4))
 
         tk.Label(
@@ -1886,7 +3930,7 @@ class PCFQueryApp(tk.Tk):
         self._sheet_var = tk.StringVar(value="")
         self._cmb_sheet = ttk.Combobox(
             self._frm_selectors, textvariable=self._sheet_var,
-            state="disabled", width=16, font=self.FONT_SMALL,
+            state="disabled", width=20, font=self.FONT_SMALL,
         )
         self._cmb_sheet.pack(side="left", padx=(0, 12))
         self._cmb_sheet.bind("<<ComboboxSelected>>", self._on_sheet_changed)
@@ -1898,93 +3942,71 @@ class PCFQueryApp(tk.Tk):
         self._col_var = tk.StringVar(value="")
         self._cmb_col = ttk.Combobox(
             self._frm_selectors, textvariable=self._col_var,
-            state="disabled", width=22, font=self.FONT_SMALL,
+            state="disabled", width=26, font=self.FONT_SMALL,
         )
-        self._cmb_col.pack(side="left")
+        self._cmb_col.pack(side="left", fill="x", expand=True)
         self._cmb_col.bind("<<ComboboxSelected>>", self._on_column_changed)
 
-        # ── File-Zusammenfassung ──────────────────────────────────────────────
-        self._divider()
-        self._section("File Summary")
-        frm_summary = self._make_panel()
-        frm_summary.pack(fill="x", padx=16, pady=(2, 4))
+        self._section_in(parent, "File Summary")
+        frm_summary = self._make_panel_in(parent)
+        frm_summary.pack(fill="x", padx=16, pady=(2, 3))
         self._lbl_summary = tk.Label(
             frm_summary, text="—",
             font=self.FONT_MONO, fg=self.C_MUTED, bg=self.C_PANEL,
-            justify="left", anchor="w",
+            justify="left", anchor="w", wraplength=640,
         )
-        self._lbl_summary.pack(anchor="w", padx=10, pady=6)
+        self._lbl_summary.pack(fill="x", padx=10, pady=5)
+        self._wrap_labels.append(self._lbl_summary)
 
-        # ── Vorschau ──────────────────────────────────────────────────────────
-        self._divider()
-        self._section("Preview  (first 10 unique products: Short / Long)")
-        frm_prev = self._make_panel()
-        frm_prev.pack(fill="x", padx=16, pady=(2, 4))
+        self._section_in(parent, "Preview  (first 8 unique products: Short / Long)")
+        frm_prev = self._make_panel_in(parent)
+        frm_prev.pack(fill="x", padx=16, pady=(2, 3))
         self._lbl_preview = tk.Label(
             frm_prev, text="—",
             font=self.FONT_MONO, fg=self.C_MUTED, bg=self.C_PANEL,
             justify="left", anchor="w",
         )
-        self._lbl_preview.pack(anchor="w", padx=10, pady=6)
+        self._lbl_preview.pack(fill="x", padx=10, pady=5)
 
-        # ── Start-Button ──────────────────────────────────────────────────────
-        self._divider()
-        btn_start_frame = tk.Frame(self, bg=self.C_BG)
-        btn_start_frame.pack(fill="x", padx=16, pady=8)
+        btn_start_frame = tk.Frame(parent, bg=self.C_BG)
+        btn_start_frame.pack(fill="x", padx=16, pady=4)
         self._btn_start = self._make_button(
             btn_start_frame, "  Start PCF Query", self._on_start_query, accent=True
         )
         self._btn_start.pack(side="left")
         self._btn_start.config(state="disabled")
 
-        # ── Fortschritt ───────────────────────────────────────────────────────
-        self._divider()
-        self._section("Progress")
-        frm_prog = tk.Frame(self, bg=self.C_BG)
+        self._section_in(parent, "Progress & Results")
+        frm_prog = self._make_panel_in(parent)
         frm_prog.pack(fill="x", padx=16, pady=(2, 4))
 
         self._progress_var = tk.DoubleVar(value=0)
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure(
-            "WAGO.Horizontal.TProgressbar",
-            troughcolor=self.C_BORDER,
-            background=self.C_ACCENT,
-            bordercolor=self.C_PANEL,
-            lightcolor=self.C_ACCENT,
-            darkcolor=self.C_ACCENT,
-        )
         ttk.Progressbar(
             frm_prog,
             variable=self._progress_var,
             maximum=100,
             style="WAGO.Horizontal.TProgressbar",
-            length=460,
-        ).pack(pady=(0, 4))
+        ).pack(padx=10, pady=(7, 3), fill="x")
 
         self._lbl_prog_count = tk.Label(
             frm_prog, text="—",
-            font=self.FONT_LABEL, fg=self.C_MUTED, bg=self.C_BG,
+            font=self.FONT_LABEL, fg=self.C_MUTED, bg=self.C_PANEL,
+            anchor="w", justify="left", wraplength=640,
         )
-        self._lbl_prog_count.pack(anchor="w")
+        self._lbl_prog_count.pack(fill="x", padx=10)
+        self._wrap_labels.append(self._lbl_prog_count)
 
         self._lbl_prog_article = tk.Label(
             frm_prog, text="",
-            font=self.FONT_MONO, fg=self.C_TEXT, bg=self.C_BG,
+            font=self.FONT_MONO, fg=self.C_TEXT, bg=self.C_PANEL, anchor="w",
         )
-        self._lbl_prog_article.pack(anchor="w")
+        self._lbl_prog_article.pack(fill="x", padx=10)
 
         self._lbl_eta = tk.Label(
             frm_prog, text="",
-            font=self.FONT_LABEL, fg=self.C_MUTED, bg=self.C_BG,
+            font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_PANEL, anchor="w",
         )
-        self._lbl_eta.pack(anchor="w", pady=(0, 4))
-
-        # ── Ergebnisse ────────────────────────────────────────────────────────
-        self._divider()
-        self._section("Results")
-        frm_res = self._make_panel()
-        frm_res.pack(fill="x", padx=16, pady=(2, 4))
+        self._lbl_eta.pack(fill="x", padx=10, pady=(0, 3))
 
         self._result_rows: Dict[str, tk.Label] = {}
         result_defs = [
@@ -1993,24 +4015,22 @@ class PCFQueryApp(tk.Tk):
             ("query_errors",      "Query errors:",      self.C_ERROR),
         ]
         for key, label, color in result_defs:
-            row = tk.Frame(frm_res, bg=self.C_PANEL)
-            row.pack(fill="x", padx=10, pady=2)
+            row = tk.Frame(frm_prog, bg=self.C_PANEL)
+            row.pack(fill="x", padx=10, pady=1)
             tk.Label(
                 row, text=label, font=self.FONT_LABEL,
-                fg=self.C_MUTED, bg=self.C_PANEL, width=28, anchor="w",
+                fg=self.C_MUTED, bg=self.C_PANEL, width=24, anchor="w",
             ).pack(side="left")
             val_lbl = tk.Label(
                 row, text="—", font=self.FONT_BOLD,
-                fg=color, bg=self.C_PANEL, width=6, anchor="e",
+                fg=color, bg=self.C_PANEL, width=10, anchor="e",
             )
             val_lbl.pack(side="left")
             self._result_rows[key] = val_lbl
-        tk.Frame(frm_res, bg=self.C_PANEL, height=4).pack()
+        tk.Frame(frm_prog, bg=self.C_PANEL, height=3).pack()
 
-        # ── Output-Buttons ────────────────────────────────────────────────────
-        self._divider()
-        frm_out = tk.Frame(self, bg=self.C_BG)
-        frm_out.pack(fill="x", padx=16, pady=8)
+        frm_out = tk.Frame(parent, bg=self.C_BG)
+        frm_out.pack(fill="x", padx=16, pady=(4, 8))
 
         self._btn_open_folder = self._make_button(
             frm_out, "  Open output folder", self._on_open_folder
@@ -2024,75 +4044,273 @@ class PCFQueryApp(tk.Tk):
         self._btn_open_excel.pack(side="left")
         self._btn_open_excel.config(state="disabled")
 
-        self._divider()
-        frm_footer = tk.Frame(self, bg=self.C_BG)
-        frm_footer.pack(fill="x", padx=16, pady=(0, 8))
+    # ── Tab 3: PCF Portfolio Coverage UI (inkl. Background Export Progress) ──
 
-        lbl_footer = tk.Label(
-            frm_footer, text="Developed by Alexander Flekler",
-            font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_BG,
+    def _build_portfolio_coverage_tab(self, parent: tk.Frame):
+        self._section_in(parent, "Internal WAGO AAS PCF Portfolio Coverage Analysis")
+        frm_desc = self._make_panel_in(parent)
+        frm_desc.pack(fill="x", padx=16, pady=(2, 4))
+
+        self._lbl_port_desc = tk.Label(
+            frm_desc,
+            text=(
+                "Analyze PCF availability across the WAGO AAS product portfolio and identify "
+                "products without published PCF data.\n"
+                "Uses the live WAGO AAS API as primary source and compares missing PCFs against "
+                "the embedded Q4 2026 dataset to identify publication and calculation candidates."
+            ),
+            font=self.FONT_SMALL,
+            fg=self.C_TEXT,
+            bg=self.C_PANEL,
+            wraplength=640,
+            justify="left",
+            anchor="w",
         )
-        lbl_footer.pack(side="left")
+        self._lbl_port_desc.pack(fill="x", padx=10, pady=6)
+        self._wrap_labels.append(self._lbl_port_desc)
 
-        btn_about = tk.Button(
-            frm_footer, text="About", command=self._on_about,
-            font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_BG,
-            relief="flat", cursor="hand2", bd=0,
-            activebackground=self.C_BG, activeforeground=self.C_TEXT,
+        frm_actions = tk.Frame(parent, bg=self.C_BG)
+        frm_actions.pack(fill="x", padx=16, pady=4)
+
+        self._btn_port_start = self._make_button(
+            frm_actions, "  Start Portfolio Analysis  ", self._on_start_portfolio_analysis, accent=True
         )
-        btn_about.pack(side="right")
-        btn_about.bind("<Enter>", lambda e: btn_about.config(fg=self.C_TEXT))
-        btn_about.bind("<Leave>", lambda e: btn_about.config(fg=self.C_MUTED))
+        self._btn_port_start.pack(side="left", padx=(0, 8))
 
-    # ── Widget-Helfer ─────────────────────────────────────────────────────────
+        self._btn_port_cancel = self._make_button(
+            frm_actions, "  Cancel Analysis  ", self._on_cancel_portfolio_analysis
+        )
+        self._btn_port_cancel.pack(side="left")
+        self._btn_port_cancel.config(state="disabled")
 
-    def _divider(self):
-        tk.Frame(self, bg=self.C_BORDER, height=1).pack(fill="x", padx=8, pady=4)
+        self._section_in(parent, "Analysis Progress & PCF Coverage Visualization")
+        frm_pprog = self._make_panel_in(parent)
+        frm_pprog.pack(fill="x", padx=16, pady=(2, 4))
 
-    def _section(self, text: str):
+        self._port_progress_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(
+            frm_pprog,
+            variable=self._port_progress_var,
+            maximum=100,
+            style="WAGO.Horizontal.TProgressbar",
+        ).pack(padx=10, pady=(7, 3), fill="x")
+
+        self._lbl_port_status = tk.Label(
+            frm_pprog, text="Ready to start portfolio analysis.",
+            font=self.FONT_LABEL, fg=self.C_MUTED, bg=self.C_PANEL,
+            anchor="w", justify="left", wraplength=640,
+        )
+        self._lbl_port_status.pack(fill="x", padx=10)
+        self._wrap_labels.append(self._lbl_port_status)
+
+        self._lbl_port_timing = tk.Label(
+            frm_pprog, text="",
+            font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_PANEL, anchor="w",
+        )
+        self._lbl_port_timing.pack(fill="x", padx=10, pady=(0, 3))
+
         tk.Label(
-            self, text=text.upper(),
-            font=("Segoe UI", 7, "bold"), fg=self.C_MUTED, bg=self.C_BG,
-        ).pack(anchor="w", padx=16, pady=(4, 0))
+            frm_pprog, text="Portfolio PCF Coverage (% of evaluated products):",
+            font=self.FONT_SMALL, fg=self.C_MUTED, bg=self.C_PANEL, anchor="w",
+        ).pack(fill="x", padx=10)
 
-    def _make_panel(self) -> tk.Frame:
+        self._port_cov_bar_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(
+            frm_pprog,
+            variable=self._port_cov_bar_var,
+            maximum=100,
+            style="WAGO.Horizontal.TProgressbar",
+        ).pack(padx=10, pady=(2, 6), fill="x")
+
+        self._section_in(parent, "Portfolio Summary")
+        frm_psum = self._make_panel_in(parent)
+        frm_psum.pack(fill="x", padx=16, pady=(2, 4))
+
+        self._portfolio_fields: Dict[str, tk.Label] = {}
+        port_defs = [
+            ("total_shells_retrieved",          "Total AAS shells retrieved:"),
+            ("total_unique_products",           "Total unique products identified:"),
+            ("successfully_evaluated_products", "Successfully evaluated products:"),
+            ("available_pcfs",                  "Available PCFs (in AAS):"),
+            ("missing_pcfs",                    "Confirmed missing PCFs (in AAS):"),
+            ("publication_candidates_count",    "PCFs available offline (Q4 2026) / missing in AAS:"),
+            ("calculation_candidates_count",    "PCFs not found in either data source:"),
+            ("technical_errors",                "Technical errors:"),
+            ("pcf_coverage_pct",                "PCF coverage:"),
+            ("analysis_completeness_pct",       "Analysis completeness:"),
+        ]
+        for p_key, p_lbl in port_defs:
+            row = tk.Frame(frm_psum, bg=self.C_PANEL)
+            row.pack(fill="x", padx=10, pady=1)
+            tk.Label(
+                row, text=p_lbl, font=self.FONT_LABEL,
+                fg=self.C_MUTED, bg=self.C_PANEL, width=44, anchor="w",
+            ).pack(side="left")
+            v_lbl = tk.Label(
+                row, text="—", font=self.FONT_BOLD,
+                fg=self.C_TEXT, bg=self.C_PANEL, width=14, anchor="e",
+            )
+            v_lbl.pack(side="left")
+            self._portfolio_fields[p_key] = v_lbl
+        tk.Frame(frm_psum, bg=self.C_PANEL, height=3).pack()
+
+        # ── Dedicated Portfolio Excel Export & Progress Section ───────────────
+        self._section_in(parent, "Portfolio Excel Report Export")
+        frm_pexp_card = self._make_panel_in(parent)
+        frm_pexp_card.pack(fill="x", padx=16, pady=(2, 8))
+
+        frm_pexp_btns = tk.Frame(frm_pexp_card, bg=self.C_PANEL)
+        frm_pexp_btns.pack(fill="x", padx=10, pady=(7, 4))
+
+        self._btn_port_export = self._make_button(
+            frm_pexp_btns, "  Export Portfolio Report (.xlsx)  ", self._on_export_portfolio_report, accent=True
+        )
+        self._btn_port_export.pack(side="left", padx=(0, 8))
+        self._btn_port_export.config(state="disabled")
+
+        self._btn_port_export_cancel = self._make_button(
+            frm_pexp_btns, "  Cancel Export  ", self.cancel_portfolio_export
+        )
+        self._btn_port_export_cancel.pack(side="left", padx=(0, 8))
+        self._btn_port_export_cancel.config(state="disabled")
+
+        self._btn_port_open_excel = self._make_button(
+            frm_pexp_btns, "  Open Report (.xlsx)  ", self._on_open_portfolio_excel
+        )
+        self._btn_port_open_excel.pack(side="left", padx=(0, 8))
+        self._btn_port_open_excel.config(state="disabled")
+
+        self._btn_port_open_folder = self._make_button(
+            frm_pexp_btns, "  Open Folder  ", self._on_open_portfolio_folder
+        )
+        self._btn_port_open_folder.pack(side="left")
+        self._btn_port_open_folder.config(state="disabled")
+
+        self._port_export_progress_var = tk.DoubleVar(value=0)
+        self._bar_port_export = ttk.Progressbar(
+            frm_pexp_card,
+            variable=self._port_export_progress_var,
+            maximum=100,
+            style="WAGO.Horizontal.TProgressbar",
+        )
+        self._bar_port_export.pack(padx=10, pady=(2, 3), fill="x")
+
+        self._lbl_port_export_stage = tk.Label(
+            frm_pexp_card,
+            text="Run or complete a portfolio analysis to export the 7-worksheet Excel report.",
+            font=self.FONT_SMALL,
+            fg=self.C_MUTED,
+            bg=self.C_PANEL,
+            anchor="w",
+            justify="left",
+            wraplength=640,
+        )
+        self._lbl_port_export_stage.pack(fill="x", padx=10)
+        self._wrap_labels.append(self._lbl_port_export_stage)
+
+        self._lbl_port_export_timing = tk.Label(
+            frm_pexp_card,
+            text="",
+            font=self.FONT_SMALL,
+            fg=self.C_MUTED,
+            bg=self.C_PANEL,
+            anchor="w",
+        )
+        self._lbl_port_export_timing.pack(fill="x", padx=10, pady=(0, 6))
+
+    # ── Widget-Helfer & Responsive Fenster-Geometrie ──────────────────────────
+
+    def _section_in(self, parent: tk.Widget, text: str):
+        tk.Label(
+            parent, text=text.upper(),
+            font=("Segoe UI", 8, "bold"), fg=self.C_MUTED, bg=self.C_BG,
+        ).pack(anchor="w", padx=16, pady=(5, 0))
+
+    def _make_panel_in(self, parent: tk.Widget) -> tk.Frame:
         return tk.Frame(
-            self, bg=self.C_PANEL, relief="flat",
+            parent, bg=self.C_PANEL, relief="flat",
             highlightbackground=self.C_BORDER, highlightthickness=1,
         )
 
-    def _make_button(self, parent: tk.Widget, text: str, command: Callable, accent: bool = False) -> tk.Button:
+    def _make_button(
+        self, parent: tk.Widget, text: str, command: Callable, accent: bool = False
+    ) -> tk.Button:
         bg = self.C_ACCENT if accent else self.C_PANEL
+        fg = WAGO_ANTHRACITE
         btn = tk.Button(
             parent, text=text, command=command,
             font=self.FONT_BOLD,
-            bg=bg, fg=self.C_BTN_FG,
+            bg=bg, fg=fg,
             activebackground=self.C_ACCENT_HOVER if accent else self.C_BORDER,
-            activeforeground=self.C_BTN_FG,
-            relief="flat", cursor="hand2",
-            padx=12, pady=6,
-            bd=0,
+            activeforeground=fg,
+            relief="solid" if not accent else "flat",
+            cursor="hand2",
+            padx=12, pady=5,
+            bd=1 if not accent else 0,
         )
-        btn.bind("<Enter>", lambda e: btn.config(
+        btn.bind("<Enter>", lambda _e: btn.config(
             bg=self.C_ACCENT_HOVER if accent else self.C_BORDER))
-        btn.bind("<Leave>", lambda e: btn.config(bg=bg))
+        btn.bind("<Leave>", lambda _e: btn.config(bg=bg))
         return btn
 
     def _center_window(self):
         self.update_idletasks()
-        w = self.winfo_width()
-        h = self.winfo_height()
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        self.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+        work_x, work_y, work_w, work_h = get_available_desktop_work_area(self)
 
-    # ── Event-Handler ─────────────────────────────────────────────────────────
-
-    def _on_about(self):
-        messagebox.showinfo(
-            "About",
-            "WAGO AAS PCF Query\nDeveloped by Alexander Flekler\nCorporate Sustainability\nVersion 2.0",
+        # Measure content requirement across header + scrollable content + footer
+        req_w = max(self.winfo_reqwidth(), self._scroll_content.winfo_reqwidth() + 24, DEFAULT_WIN_WIDTH)
+        chrome_h = (
+            self.winfo_reqheight() - self._frm_body.winfo_reqheight()
+            + self._scroll_content.winfo_reqheight() + 12
         )
+        req_h = max(chrome_h, DEFAULT_WIN_HEIGHT)
+
+        w, h, px, py, min_w, min_h = compute_responsive_window_geometry(
+            req_w, req_h, work_w, work_h, work_x=work_x, work_y=work_y
+        )
+        self.minsize(min_w, min_h)
+        self.geometry(f"{w}x{h}+{px}+{py}")
+        self.update_idletasks()
+        self._update_scrollbar_visibility()
+
+    # ── Workflow & Mode Management ────────────────────────────────────────────
+
+    def get_active_workflow(self) -> str:
+        return self._active_workflow
+
+    def select_workflow(self, workflow: str) -> None:
+        if workflow not in self._workflow_frames:
+            return
+        self._active_workflow = workflow
+
+        for wf_key, frm in self._workflow_frames.items():
+            if wf_key == workflow:
+                frm.pack(fill="both", expand=True)
+            else:
+                frm.pack_forget()
+
+        for wf_key, btn in self._tab_buttons.items():
+            if wf_key == workflow:
+                btn.config(bg=self.C_ACCENT, fg=WAGO_ANTHRACITE)
+            else:
+                btn.config(bg=WAGO_WHITE, fg=self.C_MUTED)
+
+        # In Portfolio Coverage ist Live-API-Zugriff erforderlich
+        if workflow == WORKFLOW_PORTFOLIO:
+            self._rb_online.config(state="disabled")
+            self._rb_offline.config(state="disabled")
+            self._lbl_portfolio_mode_hint.pack(side="left", padx=(12, 0))
+            if self._offline_notice_visible:
+                self._frm_offline_notice.pack_forget()
+                self._offline_notice_visible = False
+        else:
+            self._lbl_portfolio_mode_hint.pack_forget()
+            self._rb_online.config(state="normal")
+            self._rb_offline.config(state="normal")
+            self._on_mode_changed()
+
+        self.update_idletasks()
+        self._on_scroll_content_configure()
 
     def get_mode(self) -> str:
         """Gibt den aktuell ausgewaehlten Betriebsmodus ('online' oder 'offline') zurueck."""
@@ -2105,22 +4323,191 @@ class PCFQueryApp(tk.Tk):
         self._on_mode_changed()
 
     def _on_mode_changed(self):
-        is_offline = self._mode_var.get() == MODE_OFFLINE
+        is_offline = (
+            self._mode_var.get() == MODE_OFFLINE
+            and self._active_workflow != WORKFLOW_PORTFOLIO
+        )
         if is_offline and not self._offline_notice_visible:
-            self._frm_offline_notice.pack(fill="x", pady=(6, 2))
+            self._frm_offline_notice.pack(fill="x", pady=(4, 2))
             self._offline_notice_visible = True
         elif not is_offline and self._offline_notice_visible:
             self._frm_offline_notice.pack_forget()
             self._offline_notice_visible = False
         self.update_idletasks()
+        self._on_scroll_content_configure()
+
+    # ── Single Query Handlers ─────────────────────────────────────────────────
+
+    def _on_single_query(self):
+        raw_art = self._single_article_var.get().strip()
+        if not raw_art:
+            self._lbl_single_status.config(
+                text="Please enter a WAGO article number.", fg=self.C_WARN
+            )
+            return
+
+        self._btn_single_query.config(state="disabled")
+        self._lbl_single_status.config(
+            text=f"Querying '{raw_art}'...", fg=self.C_MUTED
+        )
+        self.update_idletasks()
+
+        mode = self._mode_var.get()
+        res = query_single_article(raw_art, mode=mode)
+        self._apply_single_query_result(res)
+
+    def _apply_single_query_result(self, res: Dict[str, Any]):
+        self._single_last_result = res
+        self._btn_single_query.config(state="normal")
+
+        self._single_fields["article_short"].config(text=res.get("article_short") or "—")
+        self._single_fields["article_long"].config(text=res.get("article_long") or "—")
+        self._single_fields["pcf_display"].config(
+            text=res.get("pcf_display") or STATUS_NOT_YET_AVAILABLE,
+            fg=self.C_SUCCESS if res.get("pcf") is not None else (
+                self.C_ERROR if res.get("status") == STATUS_QUERY_ERROR else self.C_WARN
+            ),
+        )
+        self._single_fields["unit"].config(text=res.get("unit") or "—")
+        self._single_fields["data_source"].config(text=res.get("data_source") or "—")
+
+        if res.get("status") == STATUS_QUERY_ERROR:
+            self._lbl_single_status.config(
+                text="Query could not be completed due to a technical communication error.",
+                fg=self.C_ERROR,
+            )
+        else:
+            self._lbl_single_status.config(text="Query completed.", fg=self.C_SUCCESS)
+
+        self._btn_copy_val.config(state="normal")
+        self._btn_copy_all.config(state="normal")
+        self.update_idletasks()
+
+    def _copy_single_result(self, value_only: bool = False) -> str:
+        if not self._single_last_result:
+            return ""
+        text = format_single_result_for_clipboard(self._single_last_result, value_only=value_only)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_idletasks()
+        self._lbl_single_status.config(
+            text="Copied to clipboard.", fg=self.C_INFO
+        )
+        return text
+
+    # ── Batch Query & Drag-and-Drop Handlers ──────────────────────────────────
+
+    def _on_about(self):
+        messagebox.showinfo(
+            "About",
+            "WAGO AAS PCF Query\nDeveloped by Alexander Flekler\nCorporate Sustainability\nVersion 3.0",
+        )
+
+    def handle_dropped_files(self, raw_paths: Union[str, List[str], Tuple[str, ...], Any]) -> bool:
+        """
+        Verarbeitet eine oder mehrere per Drag-and-Drop abgelegte Dateien sicher.
+        - Unterstuetzt .xlsx und .xls sowie Pfade mit Leerzeichen, Umlauten und Sonderzeichen.
+        - Behandelt mehrere gleichzeitig gedroppte Dateien fehlertolerant (waehlt die erste
+          gueltige Excel-Datei aus und informiert den Nutzer).
+        - Startet die PCF-Abfrage nicht automatisch.
+        - Faengt alle Ausnahmen ab, damit fehlerhafte Drops niemals zum Programmabsturz fuehren.
+        """
+        try:
+            paths = parse_dropped_file_paths(raw_paths)
+            if not paths:
+                return False
+
+            valid_excel_paths: List[str] = []
+            for p in paths:
+                ext = os.path.splitext(p)[1].lower()
+                if ext in SUPPORTED_EXCEL_EXTENSIONS and os.path.isfile(p):
+                    valid_excel_paths.append(p)
+
+            if not valid_excel_paths:
+                first_name = os.path.basename(paths[0]) or str(paths[0])
+                self._frm_drop_zone.config(bg="#FEE2E2", highlightbackground=self.C_ERROR)
+                self._lbl_drop_hint.config(
+                    text=f"Unsupported file: '{first_name}'. Please drop a valid .xlsx or .xls file.",
+                    fg=self.C_ERROR,
+                    bg="#FEE2E2",
+                )
+                return False
+
+            chosen_path = valid_excel_paths[0]
+            self.select_workflow(WORKFLOW_BATCH)
+            self._frm_drop_zone.config(bg=self.C_DROP_ACTIVE, highlightbackground=self.C_ACCENT)
+
+            if len(paths) > 1:
+                hint_txt = (
+                    f"Loaded: {os.path.basename(chosen_path)} "
+                    f"(1 of {len(paths)} dropped files selected — drop another file to replace)"
+                )
+            else:
+                hint_txt = f"Loaded: {os.path.basename(chosen_path)} (Drop another file to replace)"
+
+            self._lbl_drop_hint.config(
+                text=hint_txt,
+                fg=self.C_TEXT,
+                bg=self.C_DROP_ACTIVE,
+            )
+            self._load_file(chosen_path)
+            return True
+        except Exception as exc:
+            print(f"Drag-and-drop processing error: {exc}")
+            try:
+                self._frm_drop_zone.config(bg="#FEE2E2", highlightbackground=self.C_ERROR)
+                self._lbl_drop_hint.config(
+                    text="Could not process dropped file. Please select a valid .xlsx or .xls file.",
+                    fg=self.C_ERROR,
+                    bg="#FEE2E2",
+                )
+            except Exception:
+                pass
+            return False
+
+    def handle_dropped_file(self, path: Union[str, List[str], Tuple[str, ...]]) -> bool:
+        """Abwaertskompatibler Wrapper fuer einzelne oder mehrere gedroppte Dateipfade."""
+        return self.handle_dropped_files(path)
+
+    def clear_selected_file(self) -> None:
+        """Entfernt die aktuell ausgewaehlte Excel-Datei und setzt die Batch-Ansicht zurueck."""
+        self._input_path = None
+        self._output_path = None
+        self._df = None
+        self._detection_info = {}
+        self._selected_sheet = None
+        self._selected_column = None
+        self._canonical_articles = []
+
+        self._lbl_path.config(text="No file selected.", fg=self.C_MUTED)
+        self._frm_drop_zone.config(bg=self.C_DROP_BG, highlightbackground=self.C_ACCENT)
+        self._lbl_drop_hint.config(
+            text="Drag & Drop Excel file (.xlsx, .xls) here or click 'Select Excel File'",
+            fg=self.C_TEXT,
+            bg=self.C_DROP_BG,
+        )
+        self._sheet_var.set("")
+        self._col_var.set("")
+        self._cmb_sheet.config(state="disabled", values=[])
+        self._cmb_col.config(state="disabled", values=[])
+        self._lbl_summary.config(text="—", fg=self.C_MUTED)
+        self._lbl_preview.config(text="—", fg=self.C_MUTED)
+        self._btn_start.config(state="disabled")
+        self._btn_clear_file.config(state="disabled")
+        self.update_idletasks()
 
     def _on_select_file(self):
         path = filedialog.askopenfilename(
-            title="WAGO PCF Query – Excel-Datei auswaehlen",
-            filetypes=[("Excel-Dateien", "*.xlsx"), ("Alle Dateien", "*.*")],
+            title="WAGO PCF Query – Select Excel File",
+            filetypes=[
+                ("Excel Files", "*.xlsx *.xls"),
+                ("Excel Workbook (*.xlsx)", "*.xlsx"),
+                ("Legacy Excel 97-2003 (*.xls)", "*.xls"),
+                ("All Files", "*.*"),
+            ],
         )
         if path:
-            self._load_file(path)
+            self.handle_dropped_file(path)
 
     def _on_sheet_changed(self, _event=None):
         if self._input_path and self._sheet_var.get():
@@ -2139,6 +4526,7 @@ class PCFQueryApp(tk.Tk):
     ):
         self._input_path = path
         self._btn_start.config(state="disabled")
+        self._btn_clear_file.config(state="normal")
         self._lbl_path.config(text=path, fg=self.C_TEXT)
         self._df = None
 
@@ -2147,12 +4535,21 @@ class PCFQueryApp(tk.Tk):
                 path, sheet_name=sheet_name, article_column=article_column
             )
         except Exception as e:
+            self._frm_drop_zone.config(bg="#FEE2E2", highlightbackground=self.C_ERROR)
+            self._lbl_drop_hint.config(
+                text=f"Could not read '{os.path.basename(path)}'. Select or drop another Excel file.",
+                fg=self.C_ERROR,
+                bg="#FEE2E2",
+            )
             self._lbl_summary.config(
                 text=f"Could not read file:\n{e}", fg=self.C_ERROR,
             )
             self._lbl_preview.config(text="—", fg=self.C_MUTED)
-            self._cmb_sheet.config(state="disabled")
-            self._cmb_col.config(state="disabled")
+            self._sheet_var.set("")
+            self._col_var.set("")
+            self._cmb_sheet.config(state="disabled", values=[])
+            self._cmb_col.config(state="disabled", values=[])
+            self.update_idletasks()
             return
 
         self._df = df
@@ -2160,7 +4557,6 @@ class PCFQueryApp(tk.Tk):
         self._selected_sheet = info.get("sheet_name")
         self._selected_column = article_column or info.get("column")
 
-        # Update Comboboxen fuer Sheet- und Spaltenauswahl
         sheets = info.get("available_sheets") or []
         self._cmb_sheet["values"] = sheets
         self._sheet_var.set(self._selected_sheet or "")
@@ -2240,17 +4636,16 @@ class PCFQueryApp(tk.Tk):
         else:
             self._lbl_summary.config(text=summary_text, fg=self.C_TEXT)
 
-        # Vorschau (erste 10 eindeutige Produkte mit Short & Long)
         seen_prev = set()
         preview_lines: List[str] = []
         for c, s, l in valid_pairs:
             if c not in seen_prev:
                 seen_prev.add(c)
-                if len(preview_lines) < 10:
+                if len(preview_lines) < 8:
                     preview_lines.append(f"  {s:<22} ->  {l}")
 
-        if len(unique_canonical) > 10:
-            preview_text = "\n".join(preview_lines) + f"\n  ... ({len(unique_canonical) - 10} more)"
+        if len(unique_canonical) > 8:
+            preview_text = "\n".join(preview_lines) + f"\n  ... ({len(unique_canonical) - 8} more)"
         else:
             preview_text = "\n".join(preview_lines)
 
@@ -2287,10 +4682,6 @@ class PCFQueryApp(tk.Tk):
         self._query_thread.start()
 
     def _run_query(self):
-        """
-        Orchestrierungs-Thread: verteilt eindeutige normalisierte Artikel auf Worker via
-        ThreadPoolExecutor, sammelt Ergebnisse und sendet GUI-Updates thread-safe via after().
-        """
         start_time = time.time()
 
         counts = {
@@ -2311,7 +4702,7 @@ class PCFQueryApp(tk.Tk):
 
         def _worker(article: str) -> Tuple[str, Dict[str, Any]]:
             if self._stop_event.is_set():
-                return article, {"pcf": None, "status": STATUS_QUERY_ERROR}
+                return article, {"pcf": None, "unit": "", "status": STATUS_QUERY_ERROR}
 
             res = _query_with_timing(article, mode=active_mode)
 
@@ -2361,19 +4752,25 @@ class PCFQueryApp(tk.Tk):
             if self._selected_column != self._detection_info.get("column")
             else None
         )
-        out_df = prepare_output_dataframe(
+        results_df = prepare_output_dataframe(
             self._df, self._detection_info, cache, article_column=override_col
         )
 
         summary = None
         try:
-            out_df.to_excel(self._output_path, index=False)
+            final_out = export_batch_pcf_excel(
+                self._input_path or "input.xlsx",
+                self._output_path or "output_PCF.xlsx",
+                results_df,
+                mode=active_mode,
+            )
+            self._output_path = final_out
             summary = {
                 "unique_queried":    unique_total,
                 "pcf_available":     counts[STATUS_PCF_AVAILABLE],
                 "not_yet_available": counts[STATUS_NOT_YET_AVAILABLE],
                 "query_errors":      counts[STATUS_QUERY_ERROR],
-                "output_file":       self._output_path,
+                "output_file":       final_out,
             }
         except Exception as e:
             print(f"Fehler beim Schreiben der Ausgabedatei: {e}")
@@ -2383,8 +4780,6 @@ class PCFQueryApp(tk.Tk):
             ))
 
         self.after(0, lambda s=summary: self._on_query_done(s))
-
-    # ── GUI-Update-Callbacks (Main-Thread via after()) ─────────────────────────
 
     def _update_progress(
         self,
@@ -2401,7 +4796,7 @@ class PCFQueryApp(tk.Tk):
             fg=self.C_TEXT,
         )
         self._lbl_prog_article.config(
-            text=f"Current article: {article}", fg=self.C_ACCENT,
+            text=f"Current article: {article}", fg=self.C_TEXT,
         )
         self._lbl_eta.config(text=eta_str, fg=self.C_MUTED)
 
@@ -2425,13 +4820,22 @@ class PCFQueryApp(tk.Tk):
             )
             return
 
-        self._lbl_prog_count.config(
-            text=(
-                f"Query completed — "
-                f"{summary['unique_queried']} unique products processed"
-            ),
-            fg=self.C_SUCCESS,
-        )
+        if summary["query_errors"] > 0:
+            self._lbl_prog_count.config(
+                text=(
+                    f"Query completed with {summary['query_errors']} technical error(s) — "
+                    f"{summary['unique_queried']} unique products processed"
+                ),
+                fg=self.C_WARN,
+            )
+        else:
+            self._lbl_prog_count.config(
+                text=(
+                    f"Query completed — "
+                    f"{summary['unique_queried']} unique products processed"
+                ),
+                fg=self.C_SUCCESS,
+            )
 
         self._result_rows["pcf_available"].config(text=str(summary["pcf_available"]))
         self._result_rows["not_yet_available"].config(text=str(summary["not_yet_available"]))
@@ -2443,6 +4847,7 @@ class PCFQueryApp(tk.Tk):
     def _set_ui_running(self, running: bool):
         state = "disabled" if running else "normal"
         self._btn_select.config(state=state)
+        self._btn_clear_file.config(state=state if self._input_path else "disabled")
         self._btn_start.config(state=state)
         self._rb_online.config(state=state)
         self._rb_offline.config(state=state)
@@ -2454,6 +4859,341 @@ class PCFQueryApp(tk.Tk):
             self._cmb_sheet.config(state="readonly" if len(sheets) > 1 else "disabled")
             cols = list(self._df.columns) if self._df is not None else []
             self._cmb_col.config(state="readonly" if len(cols) > 1 else "disabled")
+
+    # ── Portfolio Coverage & Background Export Handlers ──────────────────────
+
+    def _on_start_portfolio_analysis(self):
+        if self._portfolio_export_running:
+            return
+        self._btn_port_start.config(state="disabled")
+        self._btn_port_cancel.config(state="normal")
+        self._btn_port_export.config(state="disabled")
+        self._port_progress_var.set(0)
+        self._port_cov_bar_var.set(0)
+        self._lbl_port_status.config(text="Enumerating WAGO AAS shells...", fg=self.C_TEXT)
+        self._lbl_port_timing.config(text="Elapsed: 0s")
+        for lbl in self._portfolio_fields.values():
+            lbl.config(text="—")
+
+        self._portfolio_stop_event.clear()
+        self._portfolio_thread = threading.Thread(
+            target=self._run_portfolio_worker, daemon=True
+        )
+        self._portfolio_thread.start()
+
+    def _on_cancel_portfolio_analysis(self):
+        self._portfolio_stop_event.set()
+        self._lbl_port_status.config(
+            text="Cancelling analysis... preparing partial results...", fg=self.C_WARN
+        )
+
+    def _run_portfolio_worker(self):
+        def _prog_cb(p_info: Dict[str, Any]):
+            self.after(0, lambda info=dict(p_info): self._update_portfolio_progress(info))
+
+        res = run_portfolio_coverage_analysis(
+            progress_callback=_prog_cb,
+            stop_event=self._portfolio_stop_event,
+        )
+        self.after(0, lambda r=res: self._apply_portfolio_result(r))
+
+    def _update_portfolio_progress(self, info: Dict[str, Any]):
+        phase = info.get("phase", "enumerating")
+        shells = info.get("shells_retrieved", 0)
+        uniq = info.get("unique_products", 0)
+        proc = info.get("processed_products", 0)
+        tot_v = info.get("total_to_verify", 0)
+        elapsed = int(info.get("elapsed_seconds", 0))
+        eta = info.get("eta_seconds")
+
+        if phase == "enumerating":
+            self._lbl_port_status.config(
+                text=f"Enumerating AAS portfolio: {shells} shells retrieved ({uniq} unique products)...",
+                fg=self.C_TEXT,
+            )
+            self._port_progress_var.set(min(45.0, (shells / 1000.0) * 10.0))
+        else:
+            pct = 50.0 + (proc / max(tot_v, 1)) * 50.0
+            self._port_progress_var.set(min(99.0, pct))
+            self._lbl_port_status.config(
+                text=f"Verifying PCF submodels: {proc} / {tot_v} products ({uniq} total unique)...",
+                fg=self.C_TEXT,
+            )
+
+        eta_txt = f" | ETA: {int(eta // 60)}m {int(eta % 60):02d}s" if eta is not None else ""
+        self._lbl_port_timing.config(text=f"Elapsed: {elapsed // 60}m {elapsed % 60:02d}s{eta_txt}")
+
+    def _apply_portfolio_result(self, res: Dict[str, Any]):
+        self._portfolio_result = res
+        self._btn_port_start.config(state="normal")
+        self._btn_port_cancel.config(state="disabled")
+        self._port_progress_var.set(100)
+
+        cov_pct = float(res.get("pcf_coverage_pct", 0.0))
+        comp_pct = float(res.get("analysis_completeness_pct", 0.0))
+        self._port_cov_bar_var.set(cov_pct)
+
+        if res.get("was_cancelled"):
+            self._lbl_port_status.config(
+                text="Portfolio analysis cancelled — displaying partial results.",
+                fg=self.C_WARN,
+            )
+        elif res.get("is_partial"):
+            self._lbl_port_status.config(
+                text="Portfolio analysis completed (partial/bounded scope).",
+                fg=self.C_WARN,
+            )
+        else:
+            self._lbl_port_status.config(
+                text="Portfolio analysis completed.",
+                fg=self.C_SUCCESS,
+            )
+
+        self._lbl_port_timing.config(text=f"Total elapsed: {res.get('elapsed_seconds', 0):.1f}s")
+
+        for k in (
+            "total_shells_retrieved",
+            "total_unique_products",
+            "successfully_evaluated_products",
+            "available_pcfs",
+            "missing_pcfs",
+            "publication_candidates_count",
+            "calculation_candidates_count",
+            "technical_errors",
+        ):
+            if k in self._portfolio_fields:
+                self._portfolio_fields[k].config(text=str(res.get(k, 0)))
+
+        self._portfolio_fields["pcf_coverage_pct"].config(text=f"{cov_pct:.2f}%")
+        self._portfolio_fields["analysis_completeness_pct"].config(text=f"{comp_pct:.2f}%")
+
+        if not self._portfolio_export_running:
+            self._btn_port_export.config(state="normal")
+            self._lbl_port_export_stage.config(
+                text="Ready to export portfolio report (.xlsx).",
+                fg=self.C_TEXT,
+            )
+        self.update_idletasks()
+        self._on_scroll_content_configure()
+
+    def _on_export_portfolio_report(self):
+        if not self._portfolio_result or self._portfolio_export_running:
+            return
+        default_name = f"WAGO_PCF_Portfolio_Coverage_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="Save WAGO PCF Portfolio Coverage Report",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel Workbook (*.xlsx)", "*.xlsx")],
+        )
+        if path:
+            self.start_portfolio_export(path)
+
+    def start_portfolio_export(
+        self, output_path: str, show_error_dialog: bool = True
+    ) -> bool:
+        """
+        Startet den Portfolio-Coverage-Excel-Export in einem Hintergrund-Worker-Thread,
+        damit die GUI jederzeit responsiv bleibt und keine mehrfachen Exporte parallel laufen.
+        """
+        if not self._portfolio_result or self._portfolio_export_running:
+            return False
+
+        self._portfolio_export_running = True
+        self._portfolio_export_stop_event.clear()
+        while not self._portfolio_export_queue.empty():
+            try:
+                self._portfolio_export_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self._btn_port_export.config(state="disabled")
+        self._btn_port_start.config(state="disabled")
+        self._btn_port_export_cancel.config(state="normal")
+        self._btn_port_open_excel.config(state="disabled")
+        self._btn_port_open_folder.config(state="disabled")
+
+        self._port_export_progress_var.set(1.0)
+        self._lbl_port_export_stage.config(
+            text="Preparing portfolio data...",
+            fg=self.C_TEXT,
+        )
+        self._lbl_port_export_timing.config(text="Elapsed: 0.0s")
+        self.update_idletasks()
+
+        self._portfolio_export_thread = threading.Thread(
+            target=self._run_portfolio_export_worker,
+            args=(output_path, show_error_dialog),
+            daemon=True,
+        )
+        self._portfolio_export_thread.start()
+        self.after(30, self._poll_portfolio_export_queue)
+        return True
+
+    def cancel_portfolio_export(self) -> None:
+        """Bricht einen laufenden Portfolio-Excel-Export kontrolliert ab."""
+        if not self._portfolio_export_running:
+            return
+        self._portfolio_export_stop_event.set()
+        self._btn_port_export_cancel.config(state="disabled")
+        self._lbl_port_export_stage.config(
+            text="Cancelling Excel export...",
+            fg=self.C_WARN,
+        )
+        self.update_idletasks()
+
+    def _run_portfolio_export_worker(self, output_path: str, show_error_dialog: bool = True):
+        def _export_prog_cb(p_info: Dict[str, Any]):
+            self._portfolio_export_queue.put(("progress", dict(p_info)))
+
+        out_p: Optional[str] = None
+        err_msg: Optional[str] = None
+        cancelled = False
+        t0 = time.perf_counter()
+
+        try:
+            out_p = export_portfolio_coverage_excel(
+                self._portfolio_result,
+                output_path,
+                progress_callback=_export_prog_cb,
+                stop_event=self._portfolio_export_stop_event,
+            )
+        except Exception as e:
+            if self._portfolio_export_stop_event.is_set() or "cancelled" in str(e).lower():
+                cancelled = True
+            else:
+                err_msg = str(e)
+
+        dur = time.perf_counter() - t0
+        self._portfolio_export_queue.put(
+            ("done", (out_p, err_msg, cancelled, dur, show_error_dialog))
+        )
+
+    def _poll_portfolio_export_queue(self) -> None:
+        """Verarbeitet Fortschritts- und Abschlussmeldungen des Hintergrund-Exports im Haupt-GUI-Thread."""
+        last_progress: Optional[Dict[str, Any]] = None
+        done_payload: Optional[Tuple[Optional[str], Optional[str], bool, float, bool]] = None
+
+        while True:
+            try:
+                msg_type, payload = self._portfolio_export_queue.get_nowait()
+            except queue.Empty:
+                break
+            if msg_type == "progress":
+                last_progress = payload
+            elif msg_type == "done":
+                done_payload = payload
+
+        if last_progress is not None and done_payload is None:
+            self._update_portfolio_export_progress(last_progress)
+
+        if done_payload is not None:
+            out_p, err_msg, cancelled, dur, show_dlg = done_payload
+            self._on_portfolio_export_finished(out_p, err_msg, cancelled, dur, show_dlg)
+            return
+
+        if self._portfolio_export_running:
+            self.after(30, self._poll_portfolio_export_queue)
+
+    def _update_portfolio_export_progress(self, info: Dict[str, Any]):
+        if not self._portfolio_export_running or not self.winfo_exists():
+            return
+        stage = info.get("stage", "Exporting portfolio report...")
+        ws_name = info.get("worksheet", "")
+        proc = int(info.get("processed_records", 0))
+        tot = int(info.get("total_records", 0))
+        pct = min(99.0, float(info.get("percent", 0.0)))
+        elapsed = float(info.get("elapsed_seconds", 0.0))
+        eta = info.get("eta_seconds")
+
+        # Do not show 100% until file save is completely finished
+        self._port_export_progress_var.set(pct)
+        self._lbl_port_export_stage.config(text=stage, fg=self.C_TEXT)
+
+        parts = []
+        if ws_name:
+            parts.append(f"Worksheet: {ws_name}")
+        if tot > 0:
+            parts.append(f"Records: {proc:,} / {tot:,}")
+        parts.append(f"Elapsed: {elapsed:.1f}s")
+        if eta is not None:
+            parts.append(f"ETA: {float(eta):.1f}s")
+        self._lbl_port_export_timing.config(text=" | ".join(parts))
+
+    def _on_portfolio_export_finished(
+        self,
+        out_path: Optional[str],
+        err_msg: Optional[str],
+        cancelled: bool,
+        duration: float,
+        show_error_dialog: bool = True,
+    ):
+        self._portfolio_export_running = False
+        self._btn_port_export_cancel.config(state="disabled")
+        self._btn_port_start.config(state="normal")
+        if self._portfolio_result is not None:
+            self._btn_port_export.config(state="normal")
+
+        if cancelled:
+            self._port_export_progress_var.set(0.0)
+            self._lbl_port_export_stage.config(
+                text="Export cancelled — no incomplete file was written. Analysis results remain available.",
+                fg=self.C_WARN,
+            )
+            self._lbl_port_export_timing.config(text=f"Cancelled after {duration:.1f}s")
+            return
+
+        if err_msg or not out_path or not os.path.isfile(out_path):
+            self._port_export_progress_var.set(0.0)
+            msg = err_msg or "File could not be saved."
+            self._lbl_port_export_stage.config(
+                text=f"Export failed: {msg} (Analysis results preserved — you can retry.)",
+                fg=self.C_ERROR,
+            )
+            self._lbl_port_export_timing.config(text="")
+            if show_error_dialog:
+                messagebox.showerror("Export Error", f"Could not write Portfolio Report:\n{msg}")
+            return
+
+        # 100% is ONLY displayed after the workbook has been successfully saved!
+        self._portfolio_output_path = out_path
+        self._port_export_progress_var.set(100.0)
+        fname = os.path.basename(out_path)
+        self._lbl_port_export_stage.config(
+            text=f"Report exported successfully: {fname}",
+            fg=self.C_SUCCESS,
+        )
+        self._lbl_port_export_timing.config(
+            text=f"Completed in {duration:.2f}s — saved to {out_path}"
+        )
+        self._lbl_port_status.config(
+            text=f"Report exported to: {fname}",
+            fg=self.C_SUCCESS,
+        )
+        self._btn_port_open_excel.config(state="normal")
+        self._btn_port_open_folder.config(state="normal")
+        self.update_idletasks()
+
+    def _on_open_portfolio_excel(self):
+        if self._portfolio_output_path and os.path.isfile(self._portfolio_output_path):
+            os.startfile(self._portfolio_output_path)
+        else:
+            messagebox.showwarning(
+                "File not found",
+                f"Portfolio report file not found:\n{self._portfolio_output_path}",
+            )
+
+    def _on_open_portfolio_folder(self):
+        if self._portfolio_output_path:
+            import platform
+            folder = Path(self._portfolio_output_path).parent.resolve()
+            try:
+                if platform.system() == "Windows":
+                    os.startfile(str(folder))
+                else:
+                    subprocess.Popen(["xdg-open", str(folder)])
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open folder:\n{e}")
 
     # ── Output-Aktionen ───────────────────────────────────────────────────────
 
@@ -2479,25 +5219,112 @@ class PCFQueryApp(tk.Tk):
             )
 
 
+def _post_win32_hdrop_message(hwnd: int, paths: List[str]) -> bool:
+    """
+    Erzeugt einen echten Win32 HDROP-Speicherblock (DROPFILES-Header + UTF-16LE-Pfadliste)
+    und sendet WM_DROPFILES per PostMessageW an das angegebene Fenster-Handle (wie Windows Explorer).
+    """
+    if sys.platform != "win32" or not paths:
+        return False
+    import struct
+    encoded_paths = b"".join(str(p).encode("utf-16le") + b"\x00\x00" for p in paths) + b"\x00\x00"
+    dropfiles_hdr = struct.pack("<IiiII", 20, 10, 10, 0, 1)
+    payload = dropfiles_hdr + encoded_paths
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalAlloc.argtypes  = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype   = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes   = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype    = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+
+    hglobal = kernel32.GlobalAlloc(0x0042, len(payload))
+    if not hglobal:
+        return False
+    ptr = kernel32.GlobalLock(hglobal)
+    ctypes.memmove(ptr, payload, len(payload))
+    kernel32.GlobalUnlock(hglobal)
+
+    user32 = ctypes.windll.user32
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype  = wintypes.BOOL
+    return bool(user32.PostMessageW(hwnd, WM_DROPFILES, hglobal, 0))
+
+
 # ── Einstiegspunkt ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--batch":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--batch", "--single", "--portfolio", "--test-dnd-gui"):
         import argparse
-        parser = argparse.ArgumentParser(description="WAGO AAS PCF Query Batch CLI")
-        parser.add_argument("--batch", nargs=2, metavar=("INPUT", "OUTPUT"), required=True)
+        parser = argparse.ArgumentParser(description="WAGO AAS PCF Query CLI")
+        parser.add_argument("--batch", nargs=2, metavar=("INPUT", "OUTPUT"))
+        parser.add_argument("--single", metavar="ARTICLE")
+        parser.add_argument("--portfolio", metavar="OUTPUT")
+        parser.add_argument("--test-dnd-gui", nargs=2, metavar=("SCENARIOS_JSON", "REPORT_JSON"))
+        parser.add_argument("--max-shells", type=int, default=None)
         parser.add_argument("--mode", choices=[MODE_ONLINE, MODE_OFFLINE], default=MODE_ONLINE)
         parser.add_argument("--column", default=None)
         parser.add_argument("--sheet", default=None)
         args = parser.parse_args()
-        res_summary = main(
-            args.batch[0],
-            args.batch[1],
-            article_column=args.column,
-            sheet_name=args.sheet,
-            mode=args.mode,
-        )
-        sys.exit(0 if res_summary is not None else 1)
+
+        if args.batch:
+            res_summary = main(
+                args.batch[0],
+                args.batch[1],
+                article_column=args.column,
+                sheet_name=args.sheet,
+                mode=args.mode,
+            )
+            sys.exit(0 if res_summary is not None else 1)
+        elif args.single:
+            res_single = query_single_article(args.single, mode=args.mode)
+            print(json.dumps(res_single))
+            sys.exit(0)
+        elif args.portfolio:
+            res_port = run_portfolio_coverage_analysis(max_shells=args.max_shells)
+            export_portfolio_coverage_excel(res_port, args.portfolio)
+            print(json.dumps({
+                "total_shells_retrieved": res_port["total_shells_retrieved"],
+                "total_unique_products": res_port["total_unique_products"],
+                "pcf_coverage_pct": res_port["pcf_coverage_pct"],
+                "output_file": args.portfolio,
+            }))
+            sys.exit(0)
+        elif args.test_dnd_gui:
+            scenarios_path, report_path = args.test_dnd_gui
+            scenarios = json.loads(Path(scenarios_path).read_text(encoding="utf-8"))
+            app = PCFQueryApp()
+            results_out: List[Dict[str, Any]] = []
+            step_idx = [0]
+
+            def _run_next_step():
+                idx = step_idx[0]
+                if idx >= len(scenarios):
+                    Path(report_path).write_text(
+                        json.dumps({"status": "ok", "results": results_out}, indent=2),
+                        encoding="utf-8",
+                    )
+                    app.destroy()
+                    return
+                scen = scenarios[idx]
+                _post_win32_hdrop_message(app.winfo_id(), scen["paths"])
+                app.after(140, _record_step)
+
+            def _record_step():
+                idx = step_idx[0]
+                scen = scenarios[idx]
+                results_out.append({
+                    "name": scen["name"],
+                    "input_path": app._input_path,
+                    "hint_text": app._lbl_drop_hint.cget("text"),
+                    "query_running": bool(app._query_thread and app._query_thread.is_alive()),
+                })
+                step_idx[0] += 1
+                app.after(20, _run_next_step)
+
+            app.after(80, _run_next_step)
+            app.mainloop()
+            sys.exit(0)
     else:
         app = PCFQueryApp()
         app.mainloop()

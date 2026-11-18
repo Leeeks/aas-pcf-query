@@ -11,29 +11,13 @@
 
 ## Kurzbeschreibung
 
-Dieses Tool fragt den **Product Carbon Footprint (PCF)** von WAGO-Produkten automatisiert über das **WAGO AAS-Portal** ab. Es liest eine Excel-Datei mit Artikelnummern ein, ruft für jede Nummer den PCF-Wert (kg CO2e) über die standardisierte **Asset Administration Shell (AAS) API** ab und schreibt die Ergebnisse in eine neue Excel-Datei.
+Dieses Tool fragt den **Product Carbon Footprint (PCF)** von WAGO-Produkten automatisiert über das **WAGO AAS-Portal** (`https://c1.api.wago.com/smartservice-aas`) oder optional über einen eingebetteten **Offline-Snapshot (Q4 2026)** ab.
 
-Das Projekt entstand im Rahmen des **Corporate Sustainability**-Bereichs bei WAGO und dient gleichzeitig als praxisnahe Grundlage für die Untersuchung folgender Kernfrage:
+Es bietet drei integrierte Arbeitsmodi in einer Benutzeroberfläche im **WAGO Corporate Design**:
 
-> **Wie können AAS-Daten und Nachhaltigkeitskennzahlen (PCF) als Service- oder Geschäftsmodell für WAGO gedacht werden?**
-
----
-
-## Studentenprojekt-Kontext
-
-### Hintergrund
-
-Mit der zunehmenden Regulierung im Bereich Nachhaltigkeitsberichterstattung (CSRD, CBAM, Lieferkettensorgfaltspflichtengesetz) wird der **Product Carbon Footprint** zu einem kritischen Datenpunkt in industriellen Wertschöpfungsketten. WAGO hat bereits für viele seiner Produkte PCF-Werte in der AAS hinterlegt und eine öffentliche API bereitgestellt.
-
-### Forschungsfragen für Studierende
-
-| # | Fragestellung | Bereich |
-|---|--------------|---------|
-| 1 | Welche Kunden- oder Marktgruppen haben den größten Bedarf an PCF-Daten? | Marktanalyse |
-| 2 | Welche Geschäftsmodelle sind denkbar (API-as-a-Service, Data Product, Embedded Analytics)? | Business Model Design |
-| 3 | Was müsste technisch ausgebaut werden, um einen skalierbaren PCF-Datendienst zu betreiben? | Technologie & API-Design |
-| 4 | Wie verhält sich WAGO im Vergleich zu Wettbewerbern beim digitalen Produktpass? | Benchmarking |
-| 5 | Welche regulatorischen Treiber (ESPR, CBAM, Scope-3-Reporting) erhöhen den Wert von PCF-Daten? | Regulatory Intelligence |
+1. **Single Query:** Sofortige Einzelabfrage einer WAGO-Artikelnummer (Kurz-, Lang- oder Variantenformat) inkl. PCF-Wert, Einheit (`kg CO2e`), Datenquelle und Kopierfunktion für die Zwischenablage.
+2. **Batch Query:** Struktur-agnostischer Import von `.xlsx`- und `.xls`-Dateien (auch per Drag-and-Drop), automatische Artikelnummern-Erkennung und Export einer neuen `.xlsx`-Arbeitsmappe mit einem standardisierten ersten Tabellenblatt **`PCF Results`** bei vollständiger Erhaltung der Originalblätter.
+3. **PCF Portfolio Coverage:** Interne Analyse des gesamten WAGO-AAS-Produktportfolios mit Cursor-Paginierung, Deduplizierung, PCF-Verifikation, Abgleich fehlender AAS-Werte gegen den eingebetteten Q4-2026-Snapshot und Export eines 7-teiligen Management-Reports.
 
 ---
 
@@ -42,26 +26,17 @@ Mit der zunehmenden Regulierung im Bereich Nachhaltigkeitsberichterstattung (CSR
 ### Überblick
 
 ```
-Excel Input (.xlsx) - Struktur-agnostisch (beliebige Spaltennamen/-positionen, Kurz-/Langformat)
-        |
-        v
-[  aas_pcf_query.py  ]  <- Hauptskript (Auto-Detection + Normalisierung + ThreadPoolExecutor)
-        |
-        v
-    FAST PATH (1 Request, ~66 ms)
-    Artikelnummer (normalisiert auf Kurzformat) -> CarbonFootprint-Submodel-ID
-    GET /smartservice-aas/submodels/{base64(SubmodelID)}
-        |
-        +-- HTTP 200 -> PCF-Wert extrahieren (fertig)
-        |
-        +-- HTTP 404 -> FALLBACK (1-2 Requests, ~70 ms)
-                |
-                +-- GET /smartservice-aas/shell-descriptors?assetIds={base64url(AssetIdObj)}
-                        |
-                        +-- Submodel-ID ermitteln -> PCF-Submodel fetchen
-        |
-        v
-    Excel Output (.xlsx) <- Article Number (Short) + Article Number (Long) + PCF + PCF Status
+1. Single Query          2. Batch Query (.xlsx / .xls + Drag & Drop)          3. PCF Portfolio Coverage
+       |                                    |                                            |
+       +------------------+-----------------+                                            |
+                          |                                                              |
+                          v                                                              v
+               [  aas_pcf_query.py  ]                                       [  portfolio_coverage.py  ]
+    (Auto-Detection + Normalisierung + Fast/Fallback/Offline)          (Cursor-Paginierung /shells + /submodels
+                          |                                             + Q4-2026-Abgleich + 7-Sheet-Report)
+                          v
+       Excel Output (.xlsx): Sheet 1 = "PCF Results"
+       + alle Original-Worksheets unverändert erhalten
 ```
 
 ### Verwendete AAS-Endpoints (SmartService AAS API v3.2)
@@ -70,55 +45,31 @@ Excel Input (.xlsx) - Struktur-agnostisch (beliebige Spaltennamen/-positionen, K
 |---|----------|---------|-------|
 | 1 | `https://c1.api.wago.com/smartservice-aas/submodels/{base64(ID)}` | GET | Fast Path: direkter CarbonFootprint-Submodel-Fetch |
 | 2 | `https://c1.api.wago.com/smartservice-aas/shell-descriptors?assetIds={enc}` | GET | Fallback: Shell-Lookup über `globalAssetId` |
-| 3 | `https://c1.api.wago.com/smartservice-aas/submodels/{base64(SM-ID)}` | GET | Fallback: PCF-Submodel via gefundene ID |
+| 3 | `https://c1.api.wago.com/smartservice-aas/shells?limit=1000&cursor={cur}` | GET | Portfolio Coverage: Paginierte Shell-Enumeration |
+| 4 | `https://c1.api.wago.com/smartservice-aas/submodels?idShort=CarbonFootprint&limit=500` | GET | Portfolio Coverage: Bulk-Abruf der CarbonFootprint-Submodels |
 
-### AAS-Submodel-URL-Konstruktion (Fast Path)
+---
 
-```python
-# Artikelnummer (normalisiert auf Kurzformat) -> Submodel-URL
-submodel_id = f"https://www.wago.com/submodel/{article_short}/CarbonFootprint"
-encoded     = base64.b64encode(submodel_id.encode()).decode()
-url         = f"https://c1.api.wago.com/smartservice-aas/submodels/{encoded}"
-```
+## Excel-Exportstruktur (`PCF Results`)
 
-### PCF-Submodel-Struktur (AAS v3)
+Bei der Batch-Verarbeitung bleibt die ursprüngliche Arbeitsmappe (alle Blätter, Formeln, Spalten und Formatierungen) vollständig erhalten. Als **erstes Tabellenblatt** wird **`PCF Results`** eingefügt:
 
-```
-CarbonFootprint Submodel
-+-- ProductCarbonFootprints  (SubmodelElementList)
-    +-- [0]  (SubmodelElementCollection)
-        +-- PcfCO2eq         <- Der gesuchte Wert (kg CO2e)
-        +-- PcfLifeCyclePhase
-        +-- PcfCalculationMethod
-        +-- ...
-```
+1. **Informationskopf:** Titel (`WAGO Product Carbon Footprint Data`), Exportdatum/-uhrzeit, Datenquelle (`WAGO SmartService AAS API` bzw. `Embedded Snapshot (Q4 2026)`), Kennzahlen (abgefragte / verfügbare / fehlende Produkte), Link zum [WAGO AAS Portal](https://aas.wago.com/) sowie Hinweis zum Abfragemodus.
+2. **Ergebnistabelle (exakt 4 Spalten):**
 
-### Performance-Ergebnisse (Benchmark mit 60 Artikeln, Aug 2026)
+| Article Number (Short) | Article Number (Long) | PCF | PCF Unit |
+|------------------------|-----------------------|-----|----------|
+| 221-412 | 0221-0412 | 0.011 | kg CO2e |
+| 280-101 | 0280-0101 | 0.0411 | kg CO2e |
+| 855-9910 | 0855-9910 | Not yet available | |
 
-| Pfad | Median | Artikel-Anteil |
-|------|--------|----------------|
-| Fast Path (direkter Submodel-Fetch) | **66 ms** | 58 % |
-| Fallback (Shell Registry-Lookup) | **15.551 ms** | 42 % |
-
-> **Hauptbottleneck:** Der Shell Registry-Endpoint lädt ohne serverseitige Filterung **37,7 MB mit 117.418 Einträgen** in 17 Sekunden. Ein DB-Index auf `globalAssetId` könnte die Fallback-Zeit von 15+ s auf < 500 ms reduzieren. Details: [`AAS_Performance_Analysis.md`](AAS_Performance_Analysis.md)
+> **Hinweis zu `.xls`-Dateien:** Ältere `.xls`-Dateien werden über `xlrd` eingelesen und bei der Ausgabe als `.xlsx` gespeichert. Dabei werden Zellwerte, Zahlenformate und Blattnamen übernommen; proprietäre Binär-Features älterer Excel-97-2003-Dateien (z. B. eingebettete Makros/OLE-Objekte oder komplexe bedingte Formatierungen) werden technisch bedingt nicht in `.xlsx` übertragen.
 
 ---
 
 ## Schnellstart (How-To)
 
-### Voraussetzungen
-
-- Python 3.10 oder neuer
-- Zugang zum WAGO-Netzwerk (VPN oder intern) für die API
-
-### 1. Repository klonen
-
-```bash
-git clone https://github.com/<your-username>/aas-pcf-query.git
-cd aas-pcf-query
-```
-
-### 2. Abhängigkeiten installieren
+### 1. Abhängigkeiten installieren
 
 ```bash
 pip install -r requirements.txt
@@ -126,57 +77,31 @@ pip install -r requirements.txt
 
 | Paket | Zweck |
 |-------|-------|
-| `pandas` | Excel-Lesen und -Schreiben |
-| `openpyxl` | Excel-Engine für pandas |
-| `requests` | HTTP-Abfragen der AAS-API |
-| `urllib3` | HTTP-Verbindungsmanagement & Retry-Logik |
+| `pandas` | Datenverarbeitung |
+| `openpyxl` | `.xlsx`-Lesen, -Schreiben und Formatierung |
+| `xlrd` | Lesen von Legacy-Excel-Dateien (`.xls`) |
+| `requests` / `urllib3` | HTTP-Abfragen der AAS-API inkl. Retry & Rate-Limit-Handling |
+| `pillow` | Optional für WAGO-Logo in der GUI |
 
-Optional für die GUI:
-```bash
-pip install pillow  # Für WAGO-Logo in der GUI
-```
-
-### 3. Excel-Datei vorbereiten
-
-Erstelle eine `.xlsx`-Datei mit einer Spalte **`Article Number`**:
-
-| Article Number |
-|----------------|
-| 280-101        |
-| 283-107        |
-| 221-412        |
-
-### 4. Tool ausführen
+### 2. Tool ausführen
 
 **Mit grafischer Oberfläche (empfohlen):**
 ```bash
 python aas_pcf_query.py
 ```
 
-**Programmgesteuert als Python-Bibliothek:**
-```python
-from aas_pcf_query import get_pcf, get_pcf_result, main
+**Über die Kommandozeile (CLI):**
+```bash
+# Einzelabfrage
+python aas_pcf_query.py --single 221-412
+python aas_pcf_query.py --single 0221-0412 --mode offline
 
-# Einzelner Artikel - PCF-Wert (float oder None)
-pcf = get_pcf("280-101")
-print(f"PCF: {pcf} kg CO2e")
+# Batch-Verarbeitung (.xlsx oder .xls)
+python aas_pcf_query.py input.xlsx output_pcf.xlsx --mode online
 
-# Mit Status-Information
-result = get_pcf_result("280-101")
-# -> {"pcf": 0.0156, "status": "PCF available"}
-
-# Batch-Verarbeitung einer Excel-Datei
-summary = main("input.xlsx", "output_pcf.xlsx")
+# Portfolio-Coverage-Analyse (optional mit --max-shells für Testläufe)
+python aas_pcf_query.py --portfolio portfolio_report.xlsx --max-shells 200
 ```
-
-### 5. Ergebnis
-
-| Article Number | Article Number (Short) | Article Number (Long) | PCF | PCF Status |
-|----------------|------------------------|-----------------------|-----|------------|
-| 280-101 | 280-101 | 0280-0101 | 0.0411 | PCF available |
-| 0221-0412 | 221-412 | 0221-0412 | 0.0116 | PCF available |
-| 855-9910 | 855-9910 | 0855-9910 | Not yet available | Not yet available |
-| 999-999 | 999-999 | 0999-0999 | Not yet available | Not yet available |
 
 ---
 
@@ -184,78 +109,17 @@ summary = main("input.xlsx", "output_pcf.xlsx")
 
 ```
 aas-pcf-query/
-+-- aas_pcf_query.py             # Hauptskript: API-Client + Normalisierung + Excel-Detection + GUI + Batch
++-- aas_pcf_query.py             # Hauptskript: API-Client, Normalisierung, .xlsx/.xls-Import, Export, Drag&Drop, GUI
 +-- offline_pcf_data.py          # Isoliertes Modul für den temporären Offline-Modus (eingebetteter Q4 2026 Snapshot)
++-- portfolio_coverage.py        # Modul für die interne WAGO AAS PCF Portfolio Coverage Analyse & 7-Sheet-Export
 +-- tests/
 |   +-- test_aas_pcf_query.py    # Automatisierte Pytest-Testsuite
++-- WAGO_PCF_Query.spec          # PyInstaller-Build-Spezifikation
 +-- requirements.txt             # Python-Abhängigkeiten
 +-- AAS_Performance_Analysis.md  # Performance-Analyse & Bottleneck-Report
-+-- input.xlsx                   # Beispiel-Eingabedatei (Artikelnummern)
 +-- WAGO_LOGO.webp               # Logo für GUI
 +-- README.md                    # Diese Datei
 ```
-
----
-
-## Konfiguration
-
-```python
-# In aas_pcf_query.py:
-AAS_BASE_URL           = "https://c1.api.wago.com/smartservice-aas"
-SUBMODEL_ID_TEMPLATE   = "https://www.wago.com/submodel/{article}/CarbonFootprint"
-CERT_VERIFY            = False              # TLS (Self-Signed Cert)
-REQUEST_TIMEOUT        = (5, 10)           # (connect, read) in Sekunden
-WORKERS                = 5                 # Parallele Worker-Threads
-SLOW_REQUEST_THRESHOLD = 3.0               # Logging-Schwelle in Sekunden
-```
-
----
-
-## Status-Codes (Kunden-Export)
-
-| Status | Bedeutung |
-|--------|-----------|
-| `PCF available` | PCF-Wert erfolgreich abgerufen |
-| `Not yet available` | Für dieses Produkt liegt aktuell noch kein PCF-Wert vor |
-| `Query error` | Technischer Abfragefehler (Timeout, Authentifizierungs- oder Verbindungsfehler) |
-
----
-
-## Business-Kontext: AAS als Service für WAGO
-
-### Regulatorische Treiber (Demand-Side)
-
-| Regulierung | Relevanz | Zeitlinie |
-|------------|---------|-----------|
-| **CSRD** | Scope-3-Emissionen erfordern PCF-Daten von Lieferanten | Ab 2024 (gestaffelt) |
-| **CBAM** | CO2-Intensität von Produkten muss nachgewiesen werden | Ab 2026 |
-| **ESPR / Digital Product Passport** | Maschinenlesbare Produktdaten inkl. PCF verpflichtend | Ab 2026 (gestaffelt) |
-| **ISO 14067** | PCF-Berechnung und -Kommunikation | Best Practice |
-
-### Mögliche Geschäftsmodell-Dimensionen
-
-```
-            AAS / PCF als Service
-                    |
-        +-----------+-----------+
-        |           |           |
-  Data Product   API-as-a-   Embedded
-                 Service     Sustainability
-
-  PCF-Daten als  Kunden nutzen  PCF direkt in
-  lizenziertes   WAGO-API für   Kunden-ERP/SCM
-  Datenprodukt   Scope-3-       (Plugin/
-  (CSV, API)     Reporting      Integration)
-```
-
----
-
-## Weiterführende Dokumentation
-
-- **[`AAS_Performance_Analysis.md`](AAS_Performance_Analysis.md)** – Detaillierter Performance-Benchmark-Report
-- [IDTA Submodel Template – Carbon Footprint](https://industrialdigitaltwin.org/content-hub/aasspecifications/idta-2023-0-4_submodel-template-carbon-footprint)
-- [AAS Spezifikation Part 2 – Plattform Industrie 4.0](https://www.plattform-i40.de/IP/Redaktion/EN/Standardartikel/specification-administrationshell.html)
-- [ESPR / Digital Product Passport – EU Kommission](https://ec.europa.eu/environment/ecodesign/)
 
 ---
 
@@ -263,7 +127,3 @@ SLOW_REQUEST_THRESHOLD = 3.0               # Logging-Schwelle in Sekunden
 
 **Alexander Flekler**  
 Corporate Sustainability · WAGO Kontakttechnik GmbH & Co. KG
-
----
-
-*Dieses Projekt steht für interne WAGO-Zwecke und Bildungszwecke zur Verfügung.*
