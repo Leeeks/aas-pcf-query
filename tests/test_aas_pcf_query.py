@@ -658,3 +658,256 @@ class TestExcelExport:
         assert "Article not found" not in all_exported_cells
         assert "Request timeout" not in all_exported_cells
         assert "not available" not in all_exported_cells.lower().replace("not yet available", "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. Offline Mode (Embedded Q4 2026 Snapshot) Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+import offline_pcf_data
+from offline_pcf_data import (
+    EMBEDDED_PCF_DATA,
+    OFFLINE_NOTICE_TEXT,
+    OFFLINE_NOTICE_TITLE,
+    OFFLINE_PORTAL_URL,
+    get_offline_pcf,
+    get_offline_pcf_result,
+    validate_and_index_pcf_records,
+)
+
+
+class TestOfflineMode:
+
+    def test_embedded_dataset_completeness_and_correct_values(self):
+        # Dataset contains all 9,635 consolidated Q4 2026 records embedded in Python
+        assert len(EMBEDDED_PCF_DATA) == 9635
+        assert get_offline_pcf("221-412") == pytest.approx(0.0116)
+        assert get_offline_pcf("280-101") == pytest.approx(0.0411)
+        assert get_offline_pcf("2000-115") == pytest.approx(0.001)
+        assert get_offline_pcf("221-2411") == pytest.approx(0.01847692085402356)
+        assert get_offline_pcf("734-001/K010-2937/000-100") == pytest.approx(0.08532127818568026)
+
+    @pytest.mark.parametrize(
+        "short_art, long_art",
+        [
+            ("221-412", "0221-0412"),
+            ("221-2411", "0221-2411"),
+            ("280-101", "0280-0101"),
+            ("2000-115", "2000-0115"),
+            ("734-001/K010-2937/000-100", "0734-0001/K010-2937/0000-0100"),
+            ("734-001/K000-002", "0734-0001/K000-002"),
+        ],
+    )
+    def test_both_article_formats_resolve_to_identical_offline_records(self, short_art: str, long_art: str):
+        res_s = get_offline_pcf_result(short_art)
+        res_l = get_offline_pcf_result(long_art)
+        assert res_s["status"] == STATUS_PCF_AVAILABLE
+        assert res_l["status"] == STATUS_PCF_AVAILABLE
+        assert res_s["pcf"] == pytest.approx(res_l["pcf"])
+        assert res_s["article_short"] == res_l["article_short"]
+        assert res_s["article_long"] == res_l["article_long"]
+
+    def test_offline_missing_pcf_displays_not_yet_available(self):
+        res = get_offline_pcf_result("999-999")
+        assert res["pcf"] is None
+        assert res["status"] == STATUS_NOT_YET_AVAILABLE
+        assert res["internal_status"] == INTERNAL_STATUS_NOT_FOUND
+
+    def test_offline_mode_never_makes_api_calls(self, tmp_path: Path):
+        input_path  = tmp_path / "offline_input.xlsx"
+        output_path = tmp_path / "offline_output.xlsx"
+
+        df = pd.DataFrame({
+            "Article Number": ["221-412", "0221-0412", "221-2411", "0221-2411", "999-999"],
+            "Description": ["Short 412", "Long 412", "Short 2411", "Long 2411", "Missing"],
+        })
+        df.to_excel(input_path, index=False)
+
+        with patch.object(pcf_tool, "_get_session", side_effect=AssertionError("Network session must not be used in Offline Mode!")), \
+             patch.object(pcf_tool, "_jget", side_effect=AssertionError("HTTP GET must not be called in Offline Mode!")), \
+             patch.object(pcf_tool, "get_pcf_result", side_effect=AssertionError("Online get_pcf_result must not be called in Offline Mode!")):
+            summary = main(str(input_path), str(output_path), mode=pcf_tool.MODE_OFFLINE)
+
+        assert summary is not None
+        assert summary["mode"] == pcf_tool.MODE_OFFLINE
+        assert summary["total_rows"] == 5
+        assert summary["unique_queried"] == 3  # 221-412, 221-2411, 999-999 deduplicated
+        assert summary["pcf_available"] == 4
+        assert summary["not_yet_available"] == 1
+        assert summary["query_errors"] == 0
+
+    def test_online_and_offline_generate_identical_excel_output_structure(self, tmp_path: Path):
+        input_path   = tmp_path / "struct_in.xlsx"
+        out_online   = tmp_path / "struct_online.xlsx"
+        out_offline  = tmp_path / "struct_offline.xlsx"
+
+        df = pd.DataFrame({
+            "Pos": ["1", "2", "3"],
+            "WAGO-Nr": ["280-101", "0280-0312", "999-999"],
+            "Note": ["A", "B", "C"],
+        })
+        df.to_excel(input_path, index=False)
+
+        # Offline run
+        main(str(input_path), str(out_offline), mode=pcf_tool.MODE_OFFLINE)
+
+        # Online run (mocked with matching values)
+        online_mock_map = {
+            "280-101": {"pcf": 0.0411, "status": STATUS_PCF_AVAILABLE, "internal_status": INTERNAL_STATUS_PCF_AVAILABLE},
+            "280-312": {"pcf": 0.0241, "status": STATUS_PCF_AVAILABLE, "internal_status": INTERNAL_STATUS_PCF_AVAILABLE},
+            "999-999": {"pcf": None, "status": STATUS_NOT_YET_AVAILABLE, "internal_status": INTERNAL_STATUS_NOT_FOUND},
+        }
+        with patch.object(pcf_tool, "get_pcf_result", side_effect=lambda a: online_mock_map[a]):
+            main(str(input_path), str(out_online), mode=pcf_tool.MODE_ONLINE)
+
+        df_on  = pd.read_excel(out_online, dtype=str).fillna("")
+        df_off = pd.read_excel(out_offline, dtype=str).fillna("")
+
+        assert list(df_on.columns) == list(df_off.columns)
+        assert list(df_off.columns) == [
+            "Pos",
+            "WAGO-Nr",
+            COL_ARTICLE_SHORT,
+            COL_ARTICLE_LONG,
+            "Note",
+            COL_PCF,
+            COL_PCF_STATUS,
+        ]
+        assert df_off[COL_ARTICLE_SHORT].tolist() == ["280-101", "280-312", "999-999"]
+        assert df_off[COL_ARTICLE_LONG].tolist() == ["0280-0101", "0280-0312", "0999-0999"]
+        assert float(df_off.loc[0, COL_PCF]) == pytest.approx(0.0411)
+        assert float(df_off.loc[1, COL_PCF]) == pytest.approx(0.0241)
+        assert df_off.loc[2, COL_PCF] == "Not yet available"
+        assert df_off.loc[2, COL_PCF_STATUS] == "Not yet available"
+
+    def test_conflicting_source_records_are_detected_not_silently_resolved(self):
+        # Identical values across short/long formats succeed without conflict
+        clean_idx = validate_and_index_pcf_records([
+            ("221-412", 0.0116),
+            ("0221-0412", 0.0116),
+            ("280-101", 0.0411),
+        ])
+        assert clean_idx == {"221-412": 0.0116, "280-101": 0.0411}
+
+        # Conflicting PCF values for the same product raise ValueError
+        with pytest.raises(ValueError, match="Conflicting PCF values"):
+            validate_and_index_pcf_records([
+                ("221-412", 0.0116),
+                ("0221-0412", 0.0999),
+            ])
+
+    def test_ui_q4_2026_notice_displayed_only_in_offline_mode(self):
+        app = pcf_tool.PCFQueryApp()
+        try:
+            # Default is Online Mode, notice is hidden
+            assert app.get_mode() == pcf_tool.MODE_ONLINE
+            assert app._offline_notice_visible is False
+            assert app._frm_offline_notice.winfo_manager() == ""
+
+            # Switch to Offline Mode -> notice is immediately shown with required German text & link
+            app.set_mode(pcf_tool.MODE_OFFLINE)
+            assert app.get_mode() == pcf_tool.MODE_OFFLINE
+            assert app._offline_notice_visible is True
+            assert app._frm_offline_notice.winfo_manager() == "pack"
+            assert app._lbl_offline_title.cget("text") == OFFLINE_NOTICE_TITLE
+            assert app._lbl_offline_text.cget("text") == OFFLINE_NOTICE_TEXT
+            assert app._lbl_offline_link.cget("text") == OFFLINE_PORTAL_URL
+            assert "Offline-Modus – Datenstand Q4 2026" in app._lbl_offline_title.cget("text")
+            assert "https://aas.wago.com/" == app._lbl_offline_link.cget("text")
+
+            # Switch back to Online Mode -> notice is hidden immediately
+            app.set_mode(pcf_tool.MODE_ONLINE)
+            assert app.get_mode() == pcf_tool.MODE_ONLINE
+            assert app._offline_notice_visible is False
+            assert app._frm_offline_notice.winfo_manager() == ""
+        finally:
+            app.destroy()
+
+    def test_compiled_executable_works_without_reference_excel_files(self, tmp_path: Path):
+        """
+        Verifies that the compiled dist/WAGO_PCF_Query.exe runs in Offline Mode
+        from an isolated directory when the original reference Excel files in dist/
+        are temporarily moved/renamed so they cannot be accessed at runtime.
+        """
+        import subprocess
+
+        repo_dir = Path(__file__).resolve().parent.parent
+        exe_path = repo_dir / "dist" / "WAGO_PCF_Query.exe"
+        if not exe_path.exists():
+            pytest.skip("Compiled executable dist/WAGO_PCF_Query.exe not present")
+
+        ref_files = [
+            repo_dir / "dist" / "2026 Q4_Consolidated PCF list.xlsx",
+            repo_dir / "dist" / "Artikelübersicht PCF Werte_PCF.xlsx",
+            repo_dir / "dist" / "Artikelübersicht PCF Werte.xlsx",
+        ]
+        moved_pairs = []
+
+        test_in  = tmp_path / "exe_offline_test_in.xlsx"
+        test_out = tmp_path / "exe_offline_test_out.xlsx"
+
+        df_in = pd.DataFrame({
+            "WAGO Artikel": [
+                "221-412",
+                "0221-0412",
+                "221-2411",
+                "0221-2411",
+                "734-001/K010-2937/000-100",
+                "999-999",
+            ],
+            "Comment": ["short 412", "long 412", "short 2411", "long 2411", "Q4 2026 item", "unknown"],
+        })
+        df_in.to_excel(test_in, index=False)
+
+        try:
+            # Make all reference Excel files in dist/ unavailable
+            for rf in ref_files:
+                if rf.exists():
+                    hidden_path = tmp_path / f"_hidden_{rf.name}"
+                    rf.rename(hidden_path)
+                    moved_pairs.append((hidden_path, rf))
+                    assert not rf.exists()
+
+            proc = subprocess.run(
+                [str(exe_path), "--batch", str(test_in), str(test_out), "--mode", "offline"],
+                cwd=str(tmp_path),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+            assert proc.returncode == 0, f"Executable failed: {proc.stderr}\n{proc.stdout}"
+            assert test_out.exists(), "Executable did not create output Excel file"
+        finally:
+            # Always restore reference Excel files to their original location
+            for hidden_path, orig_path in moved_pairs:
+                if hidden_path.exists():
+                    hidden_path.rename(orig_path)
+
+        df_out = pd.read_excel(test_out, dtype=str).fillna("")
+        assert df_out[COL_ARTICLE_SHORT].tolist() == [
+            "221-412",
+            "221-412",
+            "221-2411",
+            "221-2411",
+            "734-001/K010-2937/000-100",
+            "999-999",
+        ]
+        assert df_out[COL_ARTICLE_LONG].tolist() == [
+            "0221-0412",
+            "0221-0412",
+            "0221-2411",
+            "0221-2411",
+            "0734-0001/K010-2937/0000-0100",
+            "0999-0999",
+        ]
+        assert float(df_out.loc[0, COL_PCF]) == pytest.approx(0.0116)
+        assert float(df_out.loc[1, COL_PCF]) == pytest.approx(0.0116)
+        assert float(df_out.loc[2, COL_PCF]) == pytest.approx(0.01847692085402356)
+        assert float(df_out.loc[3, COL_PCF]) == pytest.approx(0.01847692085402356)
+        assert float(df_out.loc[4, COL_PCF]) == pytest.approx(0.08532127818568026)
+        assert df_out.loc[5, COL_PCF] == "Not yet available"
+        assert df_out.loc[5, COL_PCF_STATUS] == "Not yet available"
+
+

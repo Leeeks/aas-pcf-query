@@ -32,6 +32,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.parse
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -104,6 +105,14 @@ STATUS_NOT_FOUND  = INTERNAL_STATUS_NOT_FOUND
 _NOT_FOUND = object()
 _ERROR     = object()
 
+# Betriebsmodi (Online = WAGO AAS API, Offline = Eingebetteter Q4 2026 Snapshot)
+MODE_ONLINE  = "online"
+MODE_OFFLINE = "offline"
+MODE_LABELS  = {
+    MODE_ONLINE:  "Online (WAGO AAS)",
+    MODE_OFFLINE: "Offline (Q4 2026 Snapshot)",
+}
+
 # ── WAGO Artikelnummern-Normalisierung & Konvertierung ───────────────────────
 
 # Primärer Block: <Serie>-<Artikel>[Suffix], z. B. 221-412, 0221-0412, 2000-115, 770-103-JPE
@@ -118,9 +127,13 @@ _RE_PRIMARY_ALPHANUM = re.compile(
 _RE_VARIANT_NUMERIC = re.compile(
     r"^(\d{1,4})-(\d{1,4})((?:_[A-Za-z0-9]+|-[A-Za-z][A-Za-z0-9]*))?$"
 )
-# Kunden-/Sonder-Varianten-Block (nach '/'): z. B. K010-2937, K000-0001, Z000-1809
+# Kunden-/Sonder-Varianten-Block (nach '/'): z. B. K010-2937, K000-0001, K000-002, Z000-1809, Z000-046
 _RE_VARIANT_KZ = re.compile(
-    r"^[A-Za-z]\d{3}-\d{4}(?:_[A-Za-z0-9]+)?$"
+    r"^[A-Za-z]\d{3}-\d{3,4}(?:_[A-Za-z0-9]+)?$"
+)
+# Komplexer alphanumerischer Varianten-Block nach '/': z. B. 000-00200PW25-000
+_RE_VARIANT_COMPLEX = re.compile(
+    r"^(\d{3,4})-(\d{3,5}[A-Za-z0-9]+-\d{3,4})$"
 )
 # Kurzer alphabetischer Varianten-Suffix nach '/': z. B. KN
 _RE_VARIANT_ALPHA = re.compile(
@@ -354,6 +367,16 @@ def parse_article_number(value: Any, number_format: Optional[str] = None) -> Dic
             seg_formats.append("both")
             continue
 
+        m_cplx = _RE_VARIANT_COMPLEX.match(seg)
+        if m_cplx:
+            cp0, crest = m_cplx.group(1), m_cplx.group(2)
+            cp0_long  = cp0.zfill(4)
+            cp0_short = cp0_long[1:] if cp0_long.startswith("0") else cp0_long
+            short_segments.append(f"{cp0_short}-{crest}")
+            long_segments.append(f"{cp0_long}-{crest}")
+            seg_formats.append("short" if cp0 == cp0_short else "long")
+            continue
+
         m_var = _RE_VARIANT_NUMERIC.match(seg)
         if m_var:
             vp0, vp1, vsuffix = m_var.group(1), m_var.group(2), m_var.group(3) or ""
@@ -444,6 +467,22 @@ def convert_article_number(value: Any) -> Tuple[str, str]:
     """Gibt (short_format, long_format) fuer eine Artikelnummer zurueck."""
     parsed = parse_article_number(value)
     return parsed["short"], parsed["long"]
+
+
+# Isoliertes Offline-Datenmodul (Q4 2026 Snapshot) importieren
+from offline_pcf_data import (  # noqa: E402
+    EMBEDDED_PCF_DATA,
+    OFFLINE_NOTICE_TEXT,
+    OFFLINE_NOTICE_TITLE,
+    OFFLINE_PORTAL_URL,
+    OFFLINE_SNAPSHOT_VERSION,
+    get_offline_pcf,
+    get_offline_pcf_result,
+    register_article_parser,
+    validate_and_index_pcf_records,
+)
+
+register_article_parser(parse_article_number)
 
 
 # ── Struktur-agnostische Excel-Erkennung & -Verarbeitung ─────────────────────
@@ -1290,11 +1329,14 @@ def get_pcf(article_number: Any) -> Optional[float]:
     return get_pcf_result(article_number)["pcf"]
 
 
-def _query_with_timing(article_number: str) -> Dict[str, Any]:
+def _query_with_timing(article_number: str, mode: str = MODE_ONLINE) -> Dict[str, Any]:
     """
-    Fuehrt get_pcf_result() aus und loggt langsame Requests.
-    Geeignet fuer Worker-Threads.
+    Fuehrt die PCF-Abfrage im gewaehlten Modus (Online oder Offline) aus
+    und loggt langsame Requests. Geeignet fuer Worker-Threads.
     """
+    if mode == MODE_OFFLINE:
+        return get_offline_pcf_result(article_number)
+
     t0 = time.perf_counter()
     try:
         res = get_pcf_result(article_number)
@@ -1497,6 +1539,7 @@ def main(
     progress_callback: Optional[Callable[[int, int, str, Dict[str, Any]], None]] = None,
     article_column: Optional[str] = None,
     sheet_name: Optional[str] = None,
+    mode: str = MODE_ONLINE,
 ) -> Optional[Dict[str, Any]]:
     """
     Verarbeitet eine Excel-Datei mit WAGO-Artikelnummern.
@@ -1507,11 +1550,13 @@ def main(
         progress_callback : Optionale Funktion(current, total, article, result_dict)
         article_column    : Optionale explizite Spaltenauswahl (ueberschreibt Auto-Detection)
         sheet_name        : Optionaler Worksheet-Name
+        mode              : Betriebsmodus ('online' fuer WAGO AAS API, 'offline' fuer Q4 2026 Snapshot)
 
     Rueckgabe:
         dict mit Zusammenfassung oder None bei Fehler
     """
-    print(f"Lese {input_file} ...")
+    active_mode = MODE_OFFLINE if str(mode).strip().lower() == MODE_OFFLINE else MODE_ONLINE
+    print(f"Lese {input_file} (Modus: {MODE_LABELS.get(active_mode, active_mode)}) ...")
     if not os.path.exists(input_file):
         print(f"Fehler: Datei nicht gefunden: {input_file}")
         return None
@@ -1541,14 +1586,17 @@ def main(
         f"(Sheet: '{detection_info.get('sheet_name')}', Confidence: {detection_info.get('confidence', 0):.0%})"
     )
     print(f"Gefunden: {total} Zeilen, {unique_total} eindeutige Produkte (normalisiert)")
-    print(f"Starte Abfrage mit {WORKERS} parallelen Threads ...\n")
+    if active_mode == MODE_OFFLINE:
+        print(f"{OFFLINE_NOTICE_TITLE}: {OFFLINE_NOTICE_TEXT}\n")
+    else:
+        print(f"Starte Abfrage mit {WORKERS} parallelen Threads ...\n")
 
     cache: Dict[str, Dict[str, Any]] = {}
     cache_lock = threading.Lock()
     done_count = [0]
 
     def _worker(article: str) -> Tuple[str, Dict[str, Any]]:
-        res = _query_with_timing(article)
+        res = _query_with_timing(article, mode=active_mode)
         with cache_lock:
             cache[article] = res
             done_count[0] += 1
@@ -1616,6 +1664,7 @@ def main(
         "not_found":         internal_counts[INTERNAL_STATUS_NOT_FOUND],
         "detected_column":   detected_col,
         "sheet_name":        detection_info.get("sheet_name"),
+        "mode":              active_mode,
         "output_file":       output_file,
     }
 
@@ -1651,6 +1700,9 @@ class PCFQueryApp(tk.Tk):
     C_SUCCESS      = "#4caf73"
     C_WARN         = "#f0a500"
     C_ERROR        = "#e05252"
+    C_INFO         = "#4da3ff"
+    C_INFO_BG      = "#1f2a38"
+    C_INFO_BORDER  = "#2e4c73"
     C_TEXT         = "#e8eaed"
     C_MUTED        = "#8a9bb0"
     C_BTN_FG       = "#ffffff"
@@ -1676,6 +1728,8 @@ class PCFQueryApp(tk.Tk):
         self._canonical_articles: List[str]          = []
         self._query_thread: Optional[threading.Thread] = None
         self._stop_event                             = threading.Event()
+        self._mode_var                               = tk.StringVar(value=MODE_ONLINE)
+        self._offline_notice_visible: bool           = False
 
         self._build_ui()
         self._center_window()
@@ -1718,6 +1772,90 @@ class PCFQueryApp(tk.Tk):
                 tk.Label(title_frame, image=self._logo_img, bg=self.C_BG).pack(side="right", anchor="e")
         except Exception as e:
             print(f"Logo not loaded: {e}")
+
+        self._divider()
+
+        # ── Modus-Auswahl (Online / Offline) ──────────────────────────────────
+        self._section("Data Source Mode")
+        self._frm_mode_container = tk.Frame(self, bg=self.C_BG)
+        self._frm_mode_container.pack(fill="x", padx=16, pady=(2, 4))
+
+        frm_radios = tk.Frame(self._frm_mode_container, bg=self.C_BG)
+        frm_radios.pack(fill="x")
+
+        self._rb_online = tk.Radiobutton(
+            frm_radios,
+            text=MODE_LABELS[MODE_ONLINE],
+            variable=self._mode_var,
+            value=MODE_ONLINE,
+            command=self._on_mode_changed,
+            font=self.FONT_BOLD,
+            fg=self.C_TEXT,
+            bg=self.C_BG,
+            selectcolor=self.C_PANEL,
+            activebackground=self.C_BG,
+            activeforeground=self.C_ACCENT,
+            cursor="hand2",
+        )
+        self._rb_online.pack(side="left", padx=(0, 16))
+
+        self._rb_offline = tk.Radiobutton(
+            frm_radios,
+            text=MODE_LABELS[MODE_OFFLINE],
+            variable=self._mode_var,
+            value=MODE_OFFLINE,
+            command=self._on_mode_changed,
+            font=self.FONT_BOLD,
+            fg=self.C_TEXT,
+            bg=self.C_BG,
+            selectcolor=self.C_PANEL,
+            activebackground=self.C_BG,
+            activeforeground=self.C_ACCENT,
+            cursor="hand2",
+        )
+        self._rb_offline.pack(side="left")
+
+        # Informations-Banner fuer den Offline-Modus (standardmaessig ausgeblendet)
+        self._frm_offline_notice = tk.Frame(
+            self._frm_mode_container,
+            bg=self.C_INFO_BG,
+            highlightbackground=self.C_INFO_BORDER,
+            highlightthickness=1,
+        )
+        self._lbl_offline_title = tk.Label(
+            self._frm_offline_notice,
+            text=OFFLINE_NOTICE_TITLE,
+            font=self.FONT_BOLD,
+            fg=self.C_INFO,
+            bg=self.C_INFO_BG,
+            anchor="w",
+            justify="left",
+        )
+        self._lbl_offline_title.pack(fill="x", padx=10, pady=(6, 2))
+
+        self._lbl_offline_text = tk.Label(
+            self._frm_offline_notice,
+            text=OFFLINE_NOTICE_TEXT,
+            font=self.FONT_SMALL,
+            fg=self.C_TEXT,
+            bg=self.C_INFO_BG,
+            wraplength=440,
+            anchor="w",
+            justify="left",
+        )
+        self._lbl_offline_text.pack(fill="x", padx=10, pady=(0, 2))
+
+        self._lbl_offline_link = tk.Label(
+            self._frm_offline_notice,
+            text=OFFLINE_PORTAL_URL,
+            font=("Segoe UI", 8, "underline"),
+            fg=self.C_INFO,
+            bg=self.C_INFO_BG,
+            cursor="hand2",
+            anchor="w",
+        )
+        self._lbl_offline_link.pack(anchor="w", padx=10, pady=(0, 6))
+        self._lbl_offline_link.bind("<Button-1>", lambda _e: webbrowser.open(OFFLINE_PORTAL_URL))
 
         self._divider()
 
@@ -1956,6 +2094,26 @@ class PCFQueryApp(tk.Tk):
             "WAGO AAS PCF Query\nDeveloped by Alexander Flekler\nCorporate Sustainability\nVersion 2.0",
         )
 
+    def get_mode(self) -> str:
+        """Gibt den aktuell ausgewaehlten Betriebsmodus ('online' oder 'offline') zurueck."""
+        return self._mode_var.get()
+
+    def set_mode(self, mode: str) -> None:
+        """Setzt den Betriebsmodus und blendet den Q4-2026-Hinweis entsprechend ein/aus."""
+        target = MODE_OFFLINE if str(mode).strip().lower() == MODE_OFFLINE else MODE_ONLINE
+        self._mode_var.set(target)
+        self._on_mode_changed()
+
+    def _on_mode_changed(self):
+        is_offline = self._mode_var.get() == MODE_OFFLINE
+        if is_offline and not self._offline_notice_visible:
+            self._frm_offline_notice.pack(fill="x", pady=(6, 2))
+            self._offline_notice_visible = True
+        elif not is_offline and self._offline_notice_visible:
+            self._frm_offline_notice.pack_forget()
+            self._offline_notice_visible = False
+        self.update_idletasks()
+
     def _on_select_file(self):
         path = filedialog.askopenfilename(
             title="WAGO PCF Query – Excel-Datei auswaehlen",
@@ -2145,6 +2303,7 @@ class PCFQueryApp(tk.Tk):
         valid_articles  = [a for a in articles_all if a]
         unique_articles = list(dict.fromkeys(valid_articles))
         unique_total    = len(unique_articles)
+        active_mode     = self._mode_var.get()
 
         cache: Dict[str, Dict[str, Any]] = {}
         cache_lock = threading.Lock()
@@ -2154,7 +2313,7 @@ class PCFQueryApp(tk.Tk):
             if self._stop_event.is_set():
                 return article, {"pcf": None, "status": STATUS_QUERY_ERROR}
 
-            res = _query_with_timing(article)
+            res = _query_with_timing(article, mode=active_mode)
 
             with cache_lock:
                 cache[article] = res
@@ -2285,6 +2444,8 @@ class PCFQueryApp(tk.Tk):
         state = "disabled" if running else "normal"
         self._btn_select.config(state=state)
         self._btn_start.config(state=state)
+        self._rb_online.config(state=state)
+        self._rb_offline.config(state=state)
         if running:
             self._cmb_sheet.config(state="disabled")
             self._cmb_col.config(state="disabled")
@@ -2321,5 +2482,22 @@ class PCFQueryApp(tk.Tk):
 # ── Einstiegspunkt ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app = PCFQueryApp()
-    app.mainloop()
+    if len(sys.argv) > 1 and sys.argv[1] == "--batch":
+        import argparse
+        parser = argparse.ArgumentParser(description="WAGO AAS PCF Query Batch CLI")
+        parser.add_argument("--batch", nargs=2, metavar=("INPUT", "OUTPUT"), required=True)
+        parser.add_argument("--mode", choices=[MODE_ONLINE, MODE_OFFLINE], default=MODE_ONLINE)
+        parser.add_argument("--column", default=None)
+        parser.add_argument("--sheet", default=None)
+        args = parser.parse_args()
+        res_summary = main(
+            args.batch[0],
+            args.batch[1],
+            article_column=args.column,
+            sheet_name=args.sheet,
+            mode=args.mode,
+        )
+        sys.exit(0 if res_summary is not None else 1)
+    else:
+        app = PCFQueryApp()
+        app.mainloop()

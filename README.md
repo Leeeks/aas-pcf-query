@@ -185,6 +185,7 @@ summary = main("input.xlsx", "output_pcf.xlsx")
 ```
 aas-pcf-query/
 +-- aas_pcf_query.py             # Hauptskript: API-Client + Normalisierung + Excel-Detection + GUI + Batch
++-- offline_pcf_data.py          # Isoliertes Modul für den temporären Offline-Modus (eingebetteter Q4 2026 Snapshot)
 +-- tests/
 |   +-- test_aas_pcf_query.py    # Automatisierte Pytest-Testsuite
 +-- requirements.txt             # Python-Abhängigkeiten
